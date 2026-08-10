@@ -1,0 +1,27 @@
+# RTSP 输入/输出配置 —— 供 two_stage_demo.py 读取
+#
+# 三模型配置（切换各阶段模型只改这几行）
+# 注意: 流水线顺序为 pgie → helmet → vest，三个都是整帧(process-mode=1)检测器，
+#       对同一帧各自独立检测，探针按「框中心落在 person 框内」做空间关联。
+model:
+  pgie_config: pgie_config_yolo26n.txt         # 阶段一: 人体检测（YOLO26n, person 类）
+  helmet_config: pgie_config_helmet.txt        # 阶段二: 安全帽整帧检测（head/helmet）
+  vest_config: pgie_config_vest.txt            # 阶段三: 反光衣整帧检测（vest/no_vest）
+
+# 输入源: 可配置多路。注意当前 yolo26n/helmet/vest 引擎都是 batch=1，仅支持 1 路输入；
+#         后续接入多路需用 batch=N 重新构建引擎。
+sources:
+  - name: dahua1001204
+    uri: rtsp://118.140.234.166:8554/dahua1001204
+    # uri: rtsp://118.140.234.166:8554/dahua1000330
+  # 增加摄像头只需在下方追加：
+  # - name: cam2
+  #   uri: rtsp://user:pass@192.168.1.101:554/stream
+
+# RTSP 输出（nvrtspoutsinkbin 内嵌 RTSP 服务器）
+output:
+  rtsp_port: 18003          # 输出流监听端口（本地转发该端口后观看）
+  mount_point: /vest        # 播放地址: rtsp://localhost:18003/vest
+  codec: h264               # 输出编码: h264 / h265
+  bitrate: 4000000          # 编码码率 (bps)
+  idrinterval: 30           # 关键帧间隔（帧），越小客户端加入越快

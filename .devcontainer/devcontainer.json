@@ -1,0 +1,30 @@
+{
+    "name": "VideoInspector",
+    "image": "nvcr.io/nvidia/deepstream:9.0-triton-multiarch",
+    "runArgs": [
+        "--gpus=all",
+        "--privileged",
+        "-e", "DISPLAY=host.docker.internal:0.0"
+    ],
+    "remoteUser": "root",
+    "features": {
+        "ghcr.io/anthropics/devcontainer-features/claude-code:1.0": {}
+    },
+    "containerEnv": {
+        "ANTHROPIC_AUTH_TOKEN": "${localEnv:ANTHROPIC_AUTH_TOKEN}",
+        "ANTHROPIC_BASE_URL": "${localEnv:ANTHROPIC_BASE_URL}",
+        "ANTHROPIC_MODEL": "${localEnv:ANTHROPIC_MODEL}",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL": "${localEnv:ANTHROPIC_DEFAULT_HAIKU_MODEL}",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL": "${localEnv:ANTHROPIC_DEFAULT_SONNET_MODEL}",
+        "ANTHROPIC_DEFAULT_OPUS_MODEL": "${localEnv:ANTHROPIC_DEFAULT_OPUS_MODEL}"
+    },
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "ms-python.python",
+                "anthropic.claude-code"
+            ]
+        }
+    },
+    "shutdownAction": "stopContainer"
+}

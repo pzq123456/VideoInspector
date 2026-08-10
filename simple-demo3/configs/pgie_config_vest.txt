@@ -1,0 +1,41 @@
+################################################################################
+# 阶段三 vest 配置 —— 反光衣整帧检测器（vest / no_vest 2 类检测）
+#
+# 模型: models/vest/vest_b1_gpu0_fp16.engine（FP16，已预构建）
+#   输入 [1,3,640,640] RGB（静态 batch=1），输出 [1,300,6]（post-NMS）
+#   每行 = [x1,y1,x2,y2,conf,cls]；cls: 0=vest(已穿), 1=no_vest(未穿)
+#   原始 ONNX 在仓库根 models/vest.onnx（仅重建引擎时需要）
+# 解析: models/vest/libnvdsinfer_custombboxparser_vest.so
+#   → 与 helmet 解析器完全同源（导出符号 NvDsInferParseCustomHelmet），
+#     因输出格式同为 [N,6] end2end，直接复用，parse-bbox-func-name 不变。
+#   → NMS 已烧入模型，cluster-mode=4（不二次 NMS）
+#
+# 说明: 整帧检测器，作为 process-mode=1，紧跟在 pgie(yolo26n) 与 helmet 之后
+#   对同一帧独立检测，结果以 uid=4 挂在帧级；探针再按「框中心是否落在 person
+#   框内」做空间关联，得到逐人反光衣状态（冲突时 no_vest 优先）。
+################################################################################
+
+[property]
+gpu-id=0
+net-scale-factor=0.00392156862745098
+model-color-format=0
+onnx-file=/workspaces/VideoInspector/models/vest.onnx
+model-engine-file=/workspaces/VideoInspector/simple-demo3/models/vest/vest_b1_gpu0_fp16.engine
+labelfile-path=/workspaces/VideoInspector/simple-demo3/models/vest/labels.txt
+batch-size=1
+network-mode=2
+num-detected-classes=2
+process-mode=1
+gie-unique-id=4
+interval=0
+network-type=0
+cluster-mode=4
+maintain-aspect-ratio=1
+symmetric-padding=1
+custom-lib-path=/workspaces/VideoInspector/simple-demo3/models/vest/libnvdsinfer_custombboxparser_vest.so
+parse-bbox-func-name=NvDsInferParseCustomHelmet
+
+[class-attrs-all]
+pre-cluster-threshold=0.25
+topk=300
+nms-iou-threshold=0.45
