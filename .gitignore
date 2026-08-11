@@ -5,3 +5,5 @@ simple-demo/output/
 __pycache__
 output
 tmp
+alerts
+logs

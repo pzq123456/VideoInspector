@@ -16,7 +16,8 @@ server/
 ├── config.yaml             # 配置文件（修改此处即可，无需改代码）
 ├── metadata.py             # 数据契约：ObjectMeta / AttributeMeta（探针 → 状态机桥）
 ├── pipeline/
-│   └── probe.py            # SafetyProbe：三模型检测 → 空间关联 → 违规属性 → AlertManager
+│   ├── probe.py            # SafetyProbe：三模型检测 → 空间关联 → 违规属性 → AlertManager
+│   └── frame_cache.py      # 证据帧采集：tee → appsink 缓存最新原始帧（FrameCache/Retriever）
 ├── alert/
 │   ├── manager.py          # 告警管理（冷却 + 连续帧确认 + 异步 webhook 推送）
 │   └── webhook.py          # Webhook HTTP POST 推送
@@ -43,7 +44,8 @@ python -m server.main --config my_config.yaml
 RTSP 源 → nvstreammux → nvinfer(pgie: yolo26n 人体检测, uid=1)
                        → nvinfer(helmet: head/helmet 安全帽检测, uid=3)
                        → nvinfer(vest: vest/no_vest 反光衣检测, uid=4)
-                       → [nvosdbin → RTSP 输出 | fakesink]
+                       → tee → [nvosdbin → RTSP 输出 | fakesink]
+                          └── queue → nvvideoconvert → appsink（证据帧缓存）
                               ↑
                     SafetyProbe（挂在 vest 后）
 ```
@@ -133,8 +135,9 @@ RTSP 源 → nvstreammux → nvinfer(pgie: yolo26n 人体检测, uid=1)
                                  冷却期已过？
                                               ↓ 是
                                  🚨 触发告警
-                                 ├── 构建 payload（bbox + 违规属性）
-                                 └── Webhook POST（frame_base64=null，证据帧后续支持）
+                                 ├── 从 FrameCache 取该路最新原始帧（executor 线程画人物框 + 违规标签）
+                                 ├── 构建 payload（bbox + 违规属性 + frame_base64）
+                                 └── Webhook POST（带 JPEG 证据帧）
 ```
 
 ## Webhook Payload 格式
@@ -159,8 +162,9 @@ RTSP 源 → nvstreammux → nvinfer(pgie: yolo26n 人体检测, uid=1)
 }
 ```
 
-- `frame_base64` 当前为 `null`（尚未实现证据帧采集）；告警数据（bbox + 违规属性）
-  不受影响。后续实现 `tee → nvstreamdemux → appsink` 缓存最新原始帧后即可带图推送。
+- `frame_base64` 为告警时的 **JPEG 证据帧**（BGR → RGB 后由 nvvideoconvert 采集，
+  在 executor 线程画触发告警的人物框 + 违规标签后 `simplejpeg` 编码）。
+  无证据帧时仍为 `null`（缓存尚未就绪，告警不丢）。
 
 ## 关键设计
 
@@ -179,7 +183,9 @@ RTSP 源 → nvstreammux → nvinfer(pgie: yolo26n 人体检测, uid=1)
 
 ## 已知限制 / 后续项
 
-- **仅 1 路 RTSP**：引擎 batch=1，多路需重建引擎。
-- **暂无证据帧**：`frame_base64=null`；后续加 `tee` → `nvstreamdemux` →
-  `appsink×N` 缓存最新原始帧 + 自定义渲染。
+- **仅 1 路 RTSP**：引擎 batch=1，多路需重建引擎。证据帧分支当前是单 appsink
+  （缓存键=source_id）；多路需 `tee` → `nvstreamdemux` → `appsink×N` 再各自缓存。
+- **证据帧有约 1 帧滞后**：告警快照取的是缓存中的最新帧（探针在 vest、appsink
+  在下游，存在流水线时序差），作为违规瞬间的证据可接受；如需严格帧同步可改为在
+  appsink 侧用 `buffer.batch_meta` 直接判定。
 - **RTSP 预览不带违规着色框**：探针专注告警桥接，未给对象上色（demo 才有）。

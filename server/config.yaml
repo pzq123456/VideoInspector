@@ -36,10 +36,11 @@ cameras:
 # 告警参数
 # -----------------------------------------------------------------------------
 alert:
+  alert_type: "ppe"          # 与平台约定的告警类型（场景级，随 payload 原样输出）；和 target_classes 一起换
   target_classes: ['no_helmet', 'no_vest']  # 触发告警的违规属性名（匹配 ObjectMeta.attributes）
   cooldown_seconds: 10           # 同一摄像头两次告警的最小间隔（秒）
   min_detection_count: 3         # 连续检测到违规的帧数阈值（防止单帧误报）
-  save_frame_overlay: false      # 是否在证据帧上叠加摄像头名称/时间水印（暂无证据帧，保留字段）
+  save_frame_overlay: false      # 是否在证据帧上叠加摄像头名称/时间水印（证据帧已启用，告警带图）
 
   webhook:
     # url: "http://192.168.1.24:6034/protal/smoking-alarm/webhook"

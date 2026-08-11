@@ -50,12 +50,18 @@ class SafetyProbe(BatchMetadataOperator):
     Args:
         alert_managers: {source_id(int): AlertManager}，每路摄像头一个状态机。
         executor: ThreadPoolExecutor，透传给 AlertManager 用于异步 webhook。
+        frame_cache: 可选 FrameCache，触发告警时取该 source 最新原始帧作 snapshot。
     """
 
-    def __init__(self, alert_managers: dict, executor: ThreadPoolExecutor | None = None):
+    def __init__(self, alert_managers: dict,
+                 executor: ThreadPoolExecutor | None = None,
+                 frame_cache=None):
         super().__init__()
         self._managers = alert_managers
         self._executor = executor
+        # 证据帧缓存（FrameCache）: 触发告警时取该 source 最新原始帧作 snapshot。
+        # None 表示未启用证据帧采集，行为与之前一致（frame_base64=null）。
+        self._frame_cache = frame_cache
 
     def handle_metadata(self, batch_meta):
         for frame_meta in batch_meta.frame_items:
@@ -101,7 +107,12 @@ class SafetyProbe(BatchMetadataOperator):
 
             manager = self._managers.get(frame_meta.source_id)
             if manager is not None:
-                manager.handle(objects, snapshot=None, executor=self._executor)
+                # 快照只取缓存引用（不拷贝），仅在真正触发告警时才被读取/编码
+                snapshot = (
+                    self._frame_cache.latest(frame_meta.source_id)
+                    if self._frame_cache else None
+                )
+                manager.handle(objects, snapshot=snapshot, executor=self._executor)
             elif objects:
                 logger.debug("source_id={} 无对应 AlertManager，跳过告警判定",
                              frame_meta.source_id)

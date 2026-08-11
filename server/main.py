@@ -12,9 +12,11 @@
     3. 创建 Webhook 推送器 + 每路摄像头一个 AlertManager
     4. 构建 DeepStream pipeline:
            RTSP 源 → nvstreammux → nvinfer(pgie: person) → nvinfer(helmet)
-                   → nvinfer(vest) → [nvosdbin → RTSP 输出 | fakesink]
+                   → nvinfer(vest) → tee → [nvosdbin → RTSP 输出 | fakesink]
+                                    └── queue → nvvideoconvert → appsink(证据帧缓存)
     5. SafetyProbe 挂在 vest，把三模型检测元数据翻译成 ObjectMeta 喂给
-       对应摄像头的 AlertManager（冷却 + 连续帧确认 + 异步 webhook 推送）
+       对应摄像头的 AlertManager（冷却 + 连续帧确认 + 异步 webhook 推送）；
+       触发告警时带上前者缓存的最新原始帧，executor 线程画框 → JPEG → payload。
 """
 
 import argparse
@@ -35,6 +37,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 from server.alert.manager import AlertManager
 from server.alert.webhook import WebhookAlerter
+from server.pipeline.frame_cache import FrameCache, add_evidence_capture
 from server.pipeline.probe import SafetyProbe
 from server.utils.logger import setup_logger
 
@@ -134,6 +137,7 @@ def _serve(config: dict):
             save_frame_overlay=alert_cfg.get("save_frame_overlay", False),
             cooldown_seconds=alert_cfg.get("cooldown_seconds", 30),
             min_detection_count=alert_cfg.get("min_detection_count", 3),
+            alert_type=alert_cfg.get("alert_type", "ppe"),
             webhook=webhook,
         )
         logger.info("startup camera={} src={} webhook={} target={}",
@@ -162,6 +166,10 @@ def _serve(config: dict):
     p.add("nvinfer", "helmet", {"config-file-path": helmet_config, "batch-size": num})
     p.add("nvinfer", "vest", {"config-file-path": vest_config})
 
+    # 证据帧采集：nvosd 前 tee 分流，缓存每路最新原始帧（分支在 frame_cache 模块建好）
+    frame_cache = FrameCache()
+    tee_name = add_evidence_capture(p, frame_cache, gpu_id=0)
+
     if out:
         p.add("nvosdbin", "osd")
         p.add("nvrtspoutsinkbin", "rtspout", {
@@ -172,13 +180,17 @@ def _serve(config: dict):
             "idrinterval": out.get("idrinterval", 30),
             "sync": 0,
         })
-        p.link("mux", "pgie", "helmet", "vest", "osd", "rtspout")
+        p.link("mux", "pgie", "helmet", "vest", tee_name)
+        p.link(tee_name, "osd", "rtspout")
         print(f">>> RTSP 输出: rtsp://localhost:{out['rtsp_port']}{out['mount_point']}")
     else:
-        p.add("fakesink", "sink", {"sync": False})
-        p.link("mux", "pgie", "helmet", "vest", "sink")
+        p.add("fakesink", "sink", {"sync": False, "async": 0})
+        p.link("mux", "pgie", "helmet", "vest", tee_name)
+        p.link(tee_name, "sink")
 
-    p.attach("vest", Probe("safety-probe", SafetyProbe(alert_managers, executor=executor)))
+    p.attach("vest", Probe("safety-probe",
+                           SafetyProbe(alert_managers, executor=executor,
+                                       frame_cache=frame_cache)))
     p.attach("vest", "measure_fps_probe", name="fps-probe")
 
     logger.info("pipeline started cameras={} batch={}", num, num)

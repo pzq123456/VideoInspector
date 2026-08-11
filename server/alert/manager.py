@@ -20,6 +20,24 @@ from server.metadata import ObjectMeta
 from server.alert.webhook import WebhookAlerter
 
 
+def draw_alert_boxes(frame, alert_objects: list[ObjectMeta]):
+    """在证据帧上画触发告警的人物框 + 违规标签（executor 线程调用，仅告警时）。
+
+    只画触发告警的对象（alert_objects 已是按 target_classes 过滤的违规实体），
+    避免像 OSD 那样把 head/helmet/vest/person 一堆框都画上去。
+    原地修改 frame 并返回（该数组是缓存换出的旧快照，不会污染后续帧）。
+    """
+    for obj in alert_objects:
+        x1, y1, x2, y2 = obj.bbox
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)  # 红色违规框
+        labels = [a.name for a in obj.attributes]
+        label = f"{obj.class_name} {' '.join(labels)}".strip()
+        if label:
+            cv2.putText(frame, label, (x1, max(0, y1 - 6)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+    return frame
+
+
 class AlertManager:
     """管理单路摄像头的告警状态与分发。
 
@@ -36,6 +54,7 @@ class AlertManager:
         save_frame_overlay: bool = False,
         cooldown_seconds: float = 30.0,
         min_detection_count: int = 3,
+        alert_type: str | None = None,
         webhook: WebhookAlerter | None = None,
     ):
         """
@@ -47,6 +66,7 @@ class AlertManager:
             save_frame_overlay: 是否在证据帧上叠加摄像头名称/时间水印
             cooldown_seconds: 同一摄像头两次告警的最小间隔（秒）
             min_detection_count: 连续检测到目标的帧数阈值
+            alert_type: 告警类型标识（如 "ppe"），随 payload 原样输出，None 则不输出该字段
             webhook: Webhook 推送实例，None 则不推送
         """
         self.camera_id = camera_id
@@ -55,6 +75,7 @@ class AlertManager:
         self.save_frame_overlay = save_frame_overlay
         self.cooldown_seconds = cooldown_seconds
         self.min_detection_count = min_detection_count
+        self.alert_type = alert_type
         self.webhook = webhook
 
         # 内部状态
@@ -182,7 +203,11 @@ class AlertManager:
         executor 线程立即返回，不等待网络响应。
         """
         try:
-            # 1. 可选：摄像头/时间水印（仅 snapshot 非空时）
+            # 1. 标注：画触发告警的人物框 + 违规标签（仅 snapshot 非空时）
+            if snapshot is not None:
+                snapshot = draw_alert_boxes(snapshot, alert_objects)
+
+            # 2. 可选：摄像头/时间水印（仅 snapshot 非空时）
             if snapshot is not None and self.save_frame_overlay:
                 overlay_text = [
                     f"Camera: {self.camera_name} ({self.camera_id})",
@@ -195,13 +220,13 @@ class AlertManager:
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2,
                     )
 
-            # 2. JPEG 编码（C 扩展，释放 GIL）— executor 线程唯一重操作；
+            # 3. JPEG 编码（C 扩展，释放 GIL）— executor 线程唯一重操作；
             #    snapshot 为 None 时跳过，payload.frame_base64=null
             buffer = None
             if snapshot is not None:
                 buffer = simplejpeg.encode_jpeg(snapshot, quality=85, colorspace='BGR')
 
-            # 3. Fire-and-forget: base64 → JSON → HTTP 全部在独立 daemon 线程
+            # 4. Fire-and-forget: base64 → JSON → HTTP 全部在独立 daemon 线程
             threading.Thread(
                 target=self._send_payload,
                 args=(buffer, alert_objects, iso_timestamp),
@@ -245,6 +270,7 @@ class AlertManager:
                 objects_payload.append(entry)
 
             payload = {
+                "alert_type": self.alert_type,
                 "camera_id": self.camera_id,
                 "camera_name": self.camera_name,
                 "timestamp": iso_timestamp,
