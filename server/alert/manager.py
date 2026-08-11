@@ -163,16 +163,12 @@ class AlertManager:
 
         self._last_alert_time = time.time()
 
-        # JPEG 编码在 executor 线程，base64/JSON/HTTP 由 daemon 线程 fire-and-forget
-        if self.webhook and executor is not None and snapshot is not None:
+        # JPEG 编码在 executor 线程，base64/JSON/HTTP 由 daemon 线程 fire-and-forget。
+        # snapshot 为 None 时仍推送（frame_base64=null），保证无证据帧时不丢告警。
+        if self.webhook and executor is not None:
             executor.submit(
                 self._build_and_send,
                 snapshot, alert_objects, iso_timestamp,
-            )
-        elif self.webhook and snapshot is None:
-            logger.warning(
-                "[{}] 告警触发但无证据帧可用，跳过证据帧",
-                self.camera_name,
             )
 
     # ------------------------------------------------------------------
@@ -186,8 +182,8 @@ class AlertManager:
         executor 线程立即返回，不等待网络响应。
         """
         try:
-            # 1. 可选：摄像头/时间水印
-            if self.save_frame_overlay:
+            # 1. 可选：摄像头/时间水印（仅 snapshot 非空时）
+            if snapshot is not None and self.save_frame_overlay:
                 overlay_text = [
                     f"Camera: {self.camera_name} ({self.camera_id})",
                     f"Time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}",
@@ -199,10 +195,13 @@ class AlertManager:
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2,
                     )
 
-            # 2. JPEG 编码（C 扩展，释放 GIL）— executor 线程唯一重操作
-            buffer = simplejpeg.encode_jpeg(snapshot, quality=85, colorspace='BGR')
+            # 2. JPEG 编码（C 扩展，释放 GIL）— executor 线程唯一重操作；
+            #    snapshot 为 None 时跳过，payload.frame_base64=null
+            buffer = None
+            if snapshot is not None:
+                buffer = simplejpeg.encode_jpeg(snapshot, quality=85, colorspace='BGR')
 
-            # 4. Fire-and-forget: base64 → JSON → HTTP 全部在独立 daemon 线程
+            # 3. Fire-and-forget: base64 → JSON → HTTP 全部在独立 daemon 线程
             threading.Thread(
                 target=self._send_payload,
                 args=(buffer, alert_objects, iso_timestamp),
@@ -221,8 +220,10 @@ class AlertManager:
         不阻塞 executor 线程或检测/预览管线。
         """
         try:
-            # 1. Base64 编码
-            frame_base64 = base64.b64encode(buffer).decode("utf-8")
+            # 1. Base64 编码（无证据帧时为 None）
+            frame_base64 = None
+            if buffer is not None:
+                frame_base64 = base64.b64encode(buffer).decode("utf-8")
 
             # 2. 构建告警 payload
             objects_payload = []

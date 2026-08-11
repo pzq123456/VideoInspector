@@ -1,0 +1,43 @@
+annotated-doc==0.0.4
+annotated-types==0.7.0
+anyio==4.12.1
+apparmor==4.0.1
+certifi==2026.1.4
+cupy-cuda13x==13.6.0
+distlib==0.4.0
+distro==1.9.0
+fastapi==0.135.1
+fastrlock==0.8.3
+filelock==3.20.3
+h11==0.16.0
+httpcore==1.0.9
+httpx==0.27.2
+idna==3.11
+iniconfig==2.3.0
+jaraco.context==6.1.0
+jiter==0.12.0
+LibAppArmor==4.0.1
+numpy==1.26.4
+openai==1.107.3
+packaging==24.0
+partial-json-parser==0.2.1.1.post7
+platformdirs==4.5.1
+pluggy==1.6.0
+pydantic==2.10.6
+pydantic_core==2.27.2
+Pygments==2.19.2
+pyservicemaker @ file:///opt/nvidia/deepstream/deepstream-9.0/service-maker/python/pyservicemaker-0.0.1-cp312-cp312-linux_x86_64.whl#sha256=41c71e48b9bdd82c50b348162bee35a1de52ba59f5b7a01840e76419875c24f1
+pytest==9.0.2
+python-apt==2.7.7+ubuntu5.2
+PyYAML==6.0.3
+scipy==1.16.3
+setuptools==78.1.1
+sniffio==1.3.1
+starlette==0.52.1
+tqdm==4.67.1
+tritonfrontend @ file:///opt/tritonserver/python/tritonfrontend-2.65.0-py3-none-any.whl#sha256=5172f92cd4f4d727ea38eee4921f3ab8bffc181d2b3e4e61c8ee09c66212ec33
+tritonserver @ file:///opt/tritonserver/python/tritonserver-0.0.0-py3-none-any.whl#sha256=f99659d18fe7d93cf2bf43bd3b6a6bdaf8b0f1072abc0b9da276f6ad71e84860
+typing-inspection==0.4.2
+typing_extensions==4.15.0
+virtualenv==20.36.1
+wheel==0.42.0

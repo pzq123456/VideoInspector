@@ -1,73 +1,45 @@
 # =============================================================================
-# 抽烟检测服务端 配置文件
+# 安全帽 / 反光衣检测服务端 配置文件（DeepStream 三模型整帧检测）
 # =============================================================================
 # 修改此文件后重启服务即可生效，无需改动任何代码。
 # =============================================================================
 
 # -----------------------------------------------------------------------------
-# 模型参数
+# 模型参数（三阶段 DeepStream 推理）
+#   pgie   → 人体检测（yolo26n, person 类, uid=1）
+#   helmet → 安全帽整帧检测（head/helmet, uid=3）
+#   vest   → 反光衣整帧检测（vest/no_vest, uid=4）
+# 配置为 INI 文本（路径可相对项目根目录解析），引擎/parser 复用
+# simple-demo3 已有产物，无需重复导出。
 # -----------------------------------------------------------------------------
 model:
-  path: "runs/detect/yolo26m_smoking_20260702_1024/weights/best.pt"   # 抽烟模型权重路径（第二阶段，相对于项目根目录）
-  imgsz: 320                                                            # 抽烟模型输入尺寸（第二阶段/ROI推理时使用）
-  person_model:                                                       # 可选：人体检测模型（第一阶段），不配置则回退为单阶段模式
-    path: "yolo26n.pt"                                                # COCO 预训练模型，class 0 = person
-    conf: 0.5                                                         # 人体检测置信度阈值
-  conf: 0.7                                                           # 抽烟检测置信度阈值
-  device: 0                                                            # GPU 设备 ID，null 或 "cpu" 表示 CPU
-  target_classes: ['cigarette']                                         # 触发告警的目标类别（必须与模型类别名一致）
+  pgie_config: "simple-demo3/configs/pgie_config_yolo26n.txt"   # 人体检测
+  helmet_config: "simple-demo3/configs/pgie_config_helmet.txt"  # 安全帽
+  vest_config: "simple-demo3/configs/pgie_config_vest.txt"      # 反光衣
 
 # -----------------------------------------------------------------------------
 # 摄像头列表
 # -----------------------------------------------------------------------------
-# 每路摄像头需提供: id（唯一标识）、name（显示名称）、type（rtsp/local）、enabled（是否启用）
-# type=rtsp 时需填 rtsp_url；type=local 时可选填 device_id（默认 0）
+# 注意：当前三个引擎均为 batch=1，仅支持 1 路 RTSP 输入；
+#       多路需用 batch=N 重建引擎（见 server/README.md）。
+# type=rtsp 时需填 rtsp_url。
 cameras:
-  # - id: "1363"
-  #   name: "Mobile Camera 1363"
-  #   type: "rtsp"
-  #   rtsp_url: "rtsp://118.140.234.166:8554/dahua1001182"
-  #   enabled: true
-  # - id: "1384"
-  #   name: "Mobile Camera 1384"
-  #   type: "rtsp"
-  #   rtsp_url: "rtsp://118.140.234.166:8554/dahua1001204"
-  #   enabled: true
-  # - id: "1385"
-  #   name: "Mobile Camera 1385"
-  #   type: "rtsp"
-  #   rtsp_url: "rtsp://118.140.234.166:8554/dahua1001723"
-  #   enabled: true
-  # - id: "671"
-  #   name: "Mobile Camera 0671"
-  #   type: "rtsp"
-  #   rtsp_url: "rtsp://118.140.234.166:8554/dahua1000330"
-  #   enabled: true
-  # - id: "676"
-  #   name: "Mobile Camera 0676"
-  #   type: "rtsp"
-  #   rtsp_url: "rtsp://118.140.234.166:8554/dahua1000325"
-  #   enabled: true
-  # - id: "891"
-  #   name: "Mobile Camera 0891"
-  #   type: "rtsp"
-  #   rtsp_url: "rtsp://118.140.234.166:8554/dahua1000352"
-  #   enabled: true
-
-  # --- 本地摄像头（USB / 内置），测试用 ---
-  - id: "local_webcam"
-    name: "本地摄像头"
-    type: "local"
-    device_id: 0                                                     # 0=默认摄像头
+  - id: "1363"
+    name: "Mobile Camera 1363"
+    type: "rtsp"
+    rtsp_url: "rtsp://118.140.234.166:8554/dahua1000352"
+    # rtsp://118.140.234.166:8554/dahua1000330
+    # rtsp_url: "rtsp://118.140.234.166:8554/dahua1000330"
     enabled: true
 
 # -----------------------------------------------------------------------------
 # 告警参数
 # -----------------------------------------------------------------------------
 alert:
+  target_classes: ['no_helmet', 'no_vest']  # 触发告警的违规属性名（匹配 ObjectMeta.attributes）
   cooldown_seconds: 10           # 同一摄像头两次告警的最小间隔（秒）
-  min_detection_count: 3         # 连续检测到抽烟的帧数阈值（防止单帧误报）
-  save_frame_overlay: false      # 是否在证据帧上叠加摄像头名称/时间水印（摄像头流已自带则无需）
+  min_detection_count: 3         # 连续检测到违规的帧数阈值（防止单帧误报）
+  save_frame_overlay: false      # 是否在证据帧上叠加摄像头名称/时间水印（暂无证据帧，保留字段）
 
   webhook:
     # url: "http://192.168.1.24:6034/protal/smoking-alarm/webhook"
@@ -76,13 +48,14 @@ alert:
     retries: 2                                      # 失败重试次数
 
 # -----------------------------------------------------------------------------
-# 视频流预览（可选）
+# RTSP 输出（替代原 MJPEG 预览；注释掉 output 节即关闭）
 # -----------------------------------------------------------------------------
-# 取消注释即启用 MJPEG 实时视频流；注释掉即关闭。
-preview:
-  host: "0.0.0.0"
-  port: 8080
-  jpeg_quality: 30
+output:
+  rtsp_port: 18003          # 输出流监听端口（本地转发该端口后观看）
+  mount_point: /vest        # 播放地址: rtsp://localhost:18003/vest
+  codec: h264               # 输出编码: h264 / h265
+  bitrate: 4000000          # 编码码率 (bps)
+  idrinterval: 30           # 关键帧间隔（帧）
 
 # -----------------------------------------------------------------------------
 # 日志参数
