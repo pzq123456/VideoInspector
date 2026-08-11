@@ -7,13 +7,13 @@
     python -m server.main --config my.yaml # 指定配置文件
 
 工作流程:
-    1. 加载并校验 YAML 配置（摄像头仅支持 RTSP，当前引擎 batch=1 → 1 路）
+    1. 加载并校验 YAML 配置（摄像头仅支持 RTSP，可多路；N 路需动态 batch 引擎）
     2. 初始化日志
-    3. 创建 Webhook 推送器 + 每路摄像头一个 AlertManager
+    3. 创建 Webhook 推送器 + 每路摄像头一个 AlertManager（source_id → manager）
     4. 构建 DeepStream pipeline:
-           RTSP 源 → nvstreammux → nvinfer(pgie: person) → nvinfer(helmet)
-                   → nvinfer(vest) → tee → [nvosdbin → RTSP 输出 | fakesink]
-                                    └── queue → nvvideoconvert → appsink(证据帧缓存)
+           RTSP 源×N → nvstreammux(batch=N) → nvinfer(pgie: person) → nvinfer(helmet)
+                    → nvinfer(vest) → tee → [nvosdbin → nvstreamdemux → RTSP 输出×N | fakesink]
+                                     └── queue → nvvideoconvert → appsink(证据帧缓存, 按 source_id)
     5. SafetyProbe 挂在 vest，把三模型检测元数据翻译成 ObjectMeta 喂给
        对应摄像头的 AlertManager（冷却 + 连续帧确认 + 异步 webhook 推送）；
        触发告警时带上前者缓存的最新原始帧，executor 线程画框 → JPEG → payload。
@@ -80,11 +80,6 @@ def _validate_config(config: dict, path: Path):
                 errors.append(f"DeepStream 仅支持 RTSP 摄像头: {cam.get('id')} (type={cam.get('type')})")
             if not cam.get("rtsp_url"):
                 errors.append(f"cameras[].rtsp_url 为必填项 (type=rtsp): {cam.get('id')}")
-        if len(cameras) > 1:
-            errors.append(
-                f"当前三个引擎均为 batch=1，仅支持 1 路 RTSP；检测到 {len(cameras)} 路。"
-                f"多路需用 batch=N 重建引擎（见 server/README.md）。"
-            )
 
     if "alert" not in config:
         errors.append("缺少 'alert' 节")
@@ -223,7 +218,7 @@ def _serve(config: dict):
     # 三个整帧检测器，顺序 pgie → helmet → vest（无次级 GIE，不会卡死）
     p.add("nvinfer", "pgie", {"config-file-path": pgie_config, "batch-size": num})
     p.add("nvinfer", "helmet", {"config-file-path": helmet_config, "batch-size": num})
-    p.add("nvinfer", "vest", {"config-file-path": vest_config})
+    p.add("nvinfer", "vest", {"config-file-path": vest_config, "batch-size": num})
 
     # 证据帧采集：nvosd 前 tee 分流，缓存每路最新原始帧（分支在 frame_cache 模块建好）
     frame_cache = FrameCache()
@@ -231,17 +226,30 @@ def _serve(config: dict):
 
     if out:
         p.add("nvosdbin", "osd")
-        p.add("nvrtspoutsinkbin", "rtspout", {
-            "rtsp-port": out["rtsp_port"],
-            "rtsp-mount-point": out["mount_point"],
-            "codec": CODEC_MAP.get(out.get("codec", "h264"), 1),
-            "bitrate": out.get("bitrate", 4000000),
-            "idrinterval": out.get("idrinterval", 30),
-            "sync": 0,
-        })
+        # 多路输出：batch 帧 → nvstreamdemux 拆成每路独立帧 → 每路一个 RTSP 输出。
+        # 每个 nvrtspoutsinkbin 自带一个 RTSP server，必须独占端口：
+        #   camera i → port = rtsp_port + i, mount = {mount_prefix}/{camera_id}
+        p.add("nvstreamdemux", "demux")
+        base_port = int(out.get("rtsp_port", 18003))
+        mount_prefix = out.get("mount_prefix", "/cam")
+        codec_val = CODEC_MAP.get(out.get("codec", "h264"), 1)
+        bitrate = out.get("bitrate", 4000000)
+        idrinterval = out.get("idrinterval", 30)
+        for i, cam in enumerate(cameras):
+            p.add("nvrtspoutsinkbin", f"rtspout{i}", {
+                "rtsp-port": base_port + i,
+                "rtsp-mount-point": f"{mount_prefix}/{cam['id']}",
+                "codec": codec_val,
+                "bitrate": bitrate,
+                "idrinterval": idrinterval,
+                "sync": 0,
+            })
+            # 请求 nvstreamdemux 的 src_%u request pad（请求顺序 = 源序号），连到该路输出
+            p.link(("demux", f"rtspout{i}"), ("src_%u", ""))
+            print(f">>> 相机 {cam['id']} RTSP 输出: "
+                  f"rtsp://localhost:{base_port + i}{mount_prefix}/{cam['id']}")
         p.link("mux", "pgie", "helmet", "vest", tee_name)
-        p.link(tee_name, "osd", "rtspout")
-        print(f">>> RTSP 输出: rtsp://localhost:{out['rtsp_port']}{out['mount_point']}")
+        p.link(tee_name, "osd", "demux")
     else:
         p.add("fakesink", "sink", {"sync": False, "async": 0})
         p.link("mux", "pgie", "helmet", "vest", tee_name)

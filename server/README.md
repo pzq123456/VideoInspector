@@ -41,13 +41,13 @@ python -m server.main --config my_config.yaml
 ## 推理流水线
 
 ```
-RTSP 源 → nvstreammux → nvinfer(pgie: yolo26n 人体检测, uid=1)
-                       → nvinfer(helmet: head/helmet 安全帽检测, uid=3)
-                       → nvinfer(vest: vest/no_vest 反光衣检测, uid=4)
-                       → tee → [nvosdbin → RTSP 输出 | fakesink]
-                          └── queue → nvvideoconvert → appsink（证据帧缓存）
-                              ↑
-                    SafetyProbe（挂在 vest 后）
+RTSP 源×N → nvstreammux(batch=N) → nvinfer(pgie: yolo26n 人体检测, uid=1)
+                                   → nvinfer(helmet: head/helmet 安全帽检测, uid=3)
+                                   → nvinfer(vest: vest/no_vest 反光衣检测, uid=4)
+                                   → tee → [nvosdbin → nvstreamdemux → RTSP 输出×N | fakesink]
+                                      └── queue → nvvideoconvert → appsink（证据帧缓存, 按 source_id）
+                                          ↑
+                               SafetyProbe（挂在 vest 后）
 ```
 
 三个模型都是**整帧检测器**（process-mode=1），对同一帧各自独立推理。探针做
@@ -80,9 +80,8 @@ RTSP 源 → nvstreammux → nvinfer(pgie: yolo26n 人体检测, uid=1)
 | `rtsp_url` | string | RTSP 流地址 |
 | `enabled` | bool | 是否启用 |
 
-> **多路限制**：当前三个引擎均为 batch=1，仅支持 **1 路** RTSP 输入。
-> 多路需用 `batch=N` 重建引擎（`trtexec --minShapes ... --optShapes ...`），
-> 然后把 mux/nvinfer 的 batch-size 设成 N。
+> **多路支持**：引擎为动态 batch（1~12），mux/nvinfer 的 `batch-size` 自动取
+> `len(cameras)`。每路摄像头独立 AlertManager + 独立 RTSP 预览输出。
 
 ### alert — 告警参数
 
@@ -105,13 +104,18 @@ RTSP 源 → nvstreammux → nvinfer(pgie: yolo26n 人体检测, uid=1)
 
 ### output — RTSP 输出（可选，替代原 MJPEG 预览）
 
+每路摄像头独立预览：相机 `i` → 端口 `rtsp_port + i`，挂载点 `{mount_prefix}/{camera_id}`。
+
 | 字段 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `rtsp_port` | int | `18003` | 输出流监听端口 |
-| `mount_point` | string | `/vest` | 播放地址 `rtsp://localhost:18003/vest` |
+| `rtsp_port` | int | `18003` | 基础端口，相机 i 输出端口 = `rtsp_port + i` |
+| `mount_prefix` | string | `/cam` | 挂载点前缀，每路 = `/cam/<camera_id>` |
 | `codec` | string | `h264` | `h264` / `h265` |
 | `bitrate` | int | `4000000` | 编码码率 (bps) |
 | `idrinterval` | int | `30` | 关键帧间隔（帧） |
+
+示例（6 路）：`rtsp://localhost:18003/cam/1363`、`rtsp://localhost:18004/cam/1384` … 依此类推。
+每个 `nvrtspoutsinkbin` 自带一个 RTSP server，因此必须独占端口；如需固定某路端口可调整 cameras 顺序。
 
 注释掉整个 `output` 节即关闭 RTSP 输出（改用 fakesink 丢弃，检测/告警不受影响）。
 
@@ -186,8 +190,8 @@ RTSP 源 → nvstreammux → nvinfer(pgie: yolo26n 人体检测, uid=1)
 
 ## 已知限制 / 后续项
 
-- **仅 1 路 RTSP**：引擎 batch=1，多路需重建引擎。证据帧分支当前是单 appsink
-  （缓存键=source_id）；多路需 `tee` → `nvstreamdemux` → `appsink×N` 再各自缓存。
+- **动态 batch 上限 12**：8GB GPU 下三个模型（yolo26n + 2×25M 参检测器）同时以
+  batch≤12 构建引擎；如需更多路需重出更大 maxShapes 引擎并评估显存，或降低分辨率。
 - **证据帧有约 1 帧滞后**：告警快照取的是缓存中的最新帧（探针在 vest、appsink
   在下游，存在流水线时序差），作为违规瞬间的证据可接受；如需严格帧同步可改为在
   appsink 侧用 `buffer.batch_meta` 直接判定。

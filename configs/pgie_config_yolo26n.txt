@@ -2,11 +2,11 @@
 # 阶段一 PGIE 配置 —— YOLO26n 人体检测（COCO 预训练，只保留 person 类）
 #
 # 模型: models/person/yolo26n.onnx
-#   输入 [1,3,640,640] RGB（静态 batch=1）
-#   输出 output0 [1,300,6]，每行 = [x1,y1,x2,y2,conf,cls]（letterboxed 640 空间，
+#   输入 [B,3,640,640] RGB（动态 batch，1~12），引擎 *_dyn_fp16.engine
+#   输出 output0 [B,300,6]，每行 = [x1,y1,x2,y2,conf,cls]（letterboxed 640 空间，
 #   坐标在网络输入空间，nvinfer 自动映射回原帧）。
 #   该 ONNX 为 ultralytics NMS 导出（TopK+GatherElements 纯标准算子，
-#   无 TRT 自定义插件），引擎由 trtexec --fp16 预构建。
+#   无 TRT 自定义插件），引擎由 trtexec --fp16 --minShapes 1 --maxShapes 12 预构建。
 # 解析: 自定义 C++ parser（models/yolo26n_parser/），只输出 class 0 (person)，
 #   并按 pre-cluster-threshold 过滤低置信度垃圾框（导出会把 300 行全部填满）。
 # 标签: configs/labels_yolo26n.txt —— 仅 "person"（num-detected-classes=1）。
@@ -21,9 +21,8 @@ net-scale-factor=0.00392156862745098
 model-color-format=0
 infer-dims=3;640;640
 onnx-file=models/person/yolo26n.onnx
-model-engine-file=models/person/yolo26n_b1_gpu0_fp16.engine
+model-engine-file=models/person/yolo26n_dyn_fp16.engine
 labelfile-path=configs/labels_yolo26n.txt
-batch-size=1
 network-mode=2
 num-detected-classes=1
 process-mode=1

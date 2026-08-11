@@ -1,10 +1,10 @@
 ################################################################################
 # 阶段三 vest 配置 —— 反光衣整帧检测器（vest / no_vest 2 类检测）
 #
-# 模型: models/vest/vest_b1_gpu0_fp16.engine（FP16，已预构建）
-#   输入 [1,3,640,640] RGB（静态 batch=1），输出 [1,300,6]（post-NMS）
+# 模型: models/vest/vest_dyn_fp16.engine（FP16 动态 batch 1~12，已预构建）
+#   输入 [B,3,640,640] RGB，输出 [B,300,6]（post-NMS）
 #   每行 = [x1,y1,x2,y2,conf,cls]；cls: 0=vest(已穿), 1=no_vest(未穿)
-#   原始 ONNX 已归档（不再随仓库分发，仅重建引擎时另行提供）。
+#   原始 ONNX（models/vest/vest.onnx）为 ultralytics NMS 导出，仅重建引擎时使用。
 # 解析: models/vest/libnvdsinfer_custombboxparser_vest.so
 #   → 与 helmet 解析器完全同源（导出符号 NvDsInferParseCustomHelmet），
 #     因输出格式同为 [N,6] end2end，直接复用，parse-bbox-func-name 不变。
@@ -22,9 +22,8 @@
 gpu-id=0
 net-scale-factor=0.00392156862745098
 model-color-format=0
-model-engine-file=models/vest/vest_b1_gpu0_fp16.engine
+model-engine-file=models/vest/vest_dyn_fp16.engine
 labelfile-path=models/vest/labels.txt
-batch-size=1
 network-mode=2
 num-detected-classes=2
 process-mode=1

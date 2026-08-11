@@ -1,10 +1,10 @@
 ################################################################################
 # 阶段三 helmet 配置 —— 安全帽整帧检测器（head / helmet 2 类检测）
 #
-# 模型: models/helmet/best_b1_gpu0_fp16.engine（FP16，已预构建）
-#   输入 [1,3,640,640] RGB（静态 batch=1），输出 [1,300,6]（post-NMS）
+# 模型: models/helmet/best_dyn_fp16.engine（FP16 动态 batch 1~12，已预构建）
+#   输入 [B,3,640,640] RGB，输出 [B,300,6]（post-NMS）
 #   每行 = [x1,y1,x2,y2,conf,cls]；cls: 0=head(未戴), 1=helmet(已戴)
-#   原始 ONNX 已归档（不再随仓库分发，仅重建引擎时另行提供）。
+#   原始 ONNX（models/helmet/best.onnx）为 ultralytics NMS 导出，仅重建引擎时使用。
 #   解析: models/helmet/libnvdsinfer_custombboxparser_helmet.so
 #   （NMS 已烧入 → cluster-mode=4）
 #
@@ -20,9 +20,8 @@
 gpu-id=0
 net-scale-factor=0.00392156862745098
 model-color-format=0
-model-engine-file=models/helmet/best_b1_gpu0_fp16.engine
+model-engine-file=models/helmet/best_dyn_fp16.engine
 labelfile-path=models/helmet/labels.txt
-batch-size=1
 network-mode=2
 num-detected-classes=2
 process-mode=1
