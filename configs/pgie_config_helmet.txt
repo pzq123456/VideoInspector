@@ -1,24 +1,27 @@
 ################################################################################
 # 阶段三 helmet 配置 —— 安全帽整帧检测器（head / helmet 2 类检测）
 #
-# 模型: models/helmet/best.onnx（原始 ONNX 在 simple-demo2/models/helmet/，仅重建引擎时需要）
+# 模型: models/helmet/best_b1_gpu0_fp16.engine（FP16，已预构建）
 #   输入 [1,3,640,640] RGB（静态 batch=1），输出 [1,300,6]（post-NMS）
 #   每行 = [x1,y1,x2,y2,conf,cls]；cls: 0=head(未戴), 1=helmet(已戴)
-#   引擎: models/helmet/best_b1_gpu0_fp16.engine（FP16，已预构建）
-#   解析: models/helmet/libnvdsinfer_custombboxparser_helmet.so（NMS 已烧入 → cluster-mode=4）
+#   原始 ONNX 已归档（不再随仓库分发，仅重建引擎时另行提供）。
+#   解析: models/helmet/libnvdsinfer_custombboxparser_helmet.so
+#   （NMS 已烧入 → cluster-mode=4）
 #
 # 说明: 本模型在整帧上训练，因此作为 process-mode=1（整帧）检测器，紧跟在
 #   PGIE(yolo26n person) 之后对同一帧做独立检测，结果以 uid=3 挂在帧级；
 #   探针再按「头盔框中心是否落在 person 框内」做空间关联，得到逐人戴帽状态。
+#
+# 路径约定: 所有模型路径均为「相对项目根目录」，服务启动时由 server/main.py
+#   锚定为绝对路径，开发容器与生产镜像（/app）通用。
 ################################################################################
 
 [property]
 gpu-id=0
 net-scale-factor=0.00392156862745098
 model-color-format=0
-onnx-file=/workspaces/VideoInspector/simple-demo2/models/helmet/best.onnx
-model-engine-file=/workspaces/VideoInspector/simple-demo3/models/helmet/best_b1_gpu0_fp16.engine
-labelfile-path=/workspaces/VideoInspector/simple-demo3/models/helmet/labels.txt
+model-engine-file=models/helmet/best_b1_gpu0_fp16.engine
+labelfile-path=models/helmet/labels.txt
 batch-size=1
 network-mode=2
 num-detected-classes=2
@@ -29,7 +32,7 @@ network-type=0
 cluster-mode=4
 maintain-aspect-ratio=1
 symmetric-padding=1
-custom-lib-path=/workspaces/VideoInspector/simple-demo3/models/helmet/libnvdsinfer_custombboxparser_helmet.so
+custom-lib-path=models/helmet/libnvdsinfer_custombboxparser_helmet.so
 parse-bbox-func-name=NvDsInferParseCustomHelmet
 
 [class-attrs-all]

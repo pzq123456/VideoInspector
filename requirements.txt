@@ -1,0 +1,4 @@
+PyYAML==6.0.3
+loguru==0.7.3
+opencv-python-headless==5.0.0.93
+simplejpeg==1.9.0

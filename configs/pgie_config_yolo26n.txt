@@ -10,6 +10,9 @@
 # 解析: 自定义 C++ parser（models/yolo26n_parser/），只输出 class 0 (person)，
 #   并按 pre-cluster-threshold 过滤低置信度垃圾框（导出会把 300 行全部填满）。
 # 标签: configs/labels_yolo26n.txt —— 仅 "person"（num-detected-classes=1）。
+#
+# 路径约定: 所有模型路径均为「相对项目根目录」，服务启动时由 server/main.py
+#   锚定为绝对路径，开发容器与生产镜像（/app）通用。
 ################################################################################
 
 [property]
@@ -17,9 +20,9 @@ gpu-id=0
 net-scale-factor=0.00392156862745098
 model-color-format=0
 infer-dims=3;640;640
-onnx-file=/workspaces/VideoInspector/simple-demo3/models/person/yolo26n.onnx
-model-engine-file=/workspaces/VideoInspector/simple-demo3/models/person/yolo26n_b1_gpu0_fp16.engine
-labelfile-path=/workspaces/VideoInspector/simple-demo3/configs/labels_yolo26n.txt
+onnx-file=models/person/yolo26n.onnx
+model-engine-file=models/person/yolo26n_b1_gpu0_fp16.engine
+labelfile-path=configs/labels_yolo26n.txt
 batch-size=1
 network-mode=2
 num-detected-classes=1
@@ -28,7 +31,7 @@ gie-unique-id=1
 interval=0
 network-type=0
 cluster-mode=4
-custom-lib-path=/workspaces/VideoInspector/simple-demo3/models/yolo26n_parser/libnvdsinfer_yolo26n_parser.so
+custom-lib-path=models/yolo26n_parser/libnvdsinfer_yolo26n_parser.so
 parse-bbox-func-name=NvDsInferParseCustomYolo26n
 maintain-aspect-ratio=1
 symmetric-padding=1

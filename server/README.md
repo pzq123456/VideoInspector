@@ -54,7 +54,7 @@ RTSP 源 → nvstreammux → nvinfer(pgie: yolo26n 人体检测, uid=1)
 **空间关联**（helmet/vest 检测框**中心点**落在 person 框内 → 归属该人），
 把违规翻译成 `AttributeMeta('no_helmet')` / `AttributeMeta('no_vest')`
 附加到对应 person 的 `ObjectMeta`，按 `source_id` 喂给对应摄像头的
-`AlertManager`。模型 / 引擎 / 自定义 parser 全部复用 `simple-demo3/` 产物。
+`AlertManager`。模型 / 引擎 / 自定义 parser 全部复用根目录 `models/` 产物。
 
 ## 配置文件参考 (config.yaml)
 
@@ -66,8 +66,9 @@ RTSP 源 → nvstreammux → nvinfer(pgie: yolo26n 人体检测, uid=1)
 | `helmet_config` | string | 安全帽整帧检测 nvinfer 配置文件路径 |
 | `vest_config` | string | 反光衣整帧检测 nvinfer 配置文件路径 |
 
-路径相对项目根目录解析；配置文件内引用 engine/parser 的绝对路径，
-默认指向 `simple-demo3/models/` 已构建产物。
+路径相对项目根目录解析；INI 配置内部引用的模型路径同样相对根目录
+（`models/` / `configs/`），启动时由 `server/main.py` 统一锚定为绝对路径，
+开发容器与生产镜像（`/app`）通用。
 
 ### cameras — 摄像头列表
 
@@ -91,6 +92,8 @@ RTSP 源 → nvstreammux → nvinfer(pgie: yolo26n 人体检测, uid=1)
 | `cooldown_seconds` | float | `30` | 同一摄像头两次告警的最小间隔（秒） |
 | `min_detection_count` | int | `3` | 连续检测到违规的帧数阈值（防止单帧误报） |
 | `save_frame_overlay` | bool | `false` | 是否在证据帧上叠加摄像头名称/时间水印（暂无证据帧，保留字段） |
+| `helmet_conf_threshold` | float | `0.5` | 头盔框空间关联 person 的最低置信度（须 ≥ INI 的 `pre-cluster-threshold=0.25`） |
+| `vest_conf_threshold` | float | `0.5` | 反光衣框空间关联 person 的最低置信度（须 ≥ INI 的 `pre-cluster-threshold=0.25`） |
 
 #### alert.webhook — Webhook 推送
 

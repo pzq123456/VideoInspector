@@ -9,13 +9,14 @@
 #   pgie   → 人体检测（yolo26n, person 类, uid=1）
 #   helmet → 安全帽整帧检测（head/helmet, uid=3）
 #   vest   → 反光衣整帧检测（vest/no_vest, uid=4）
-# 配置为 INI 文本（路径可相对项目根目录解析），引擎/parser 复用
-# simple-demo3 已有产物，无需重复导出。
+# 配置为 INI 文本（路径可相对项目根目录解析），INI 内部引用的模型路径同样
+# 相对根目录，启动时由 server/main.py 统一锚定为绝对路径（开发容器 /
+# 生产镜像 /app 通用）。引擎/parser 复用根目录 models/ 已有产物。
 # -----------------------------------------------------------------------------
 model:
-  pgie_config: "simple-demo3/configs/pgie_config_yolo26n.txt"   # 人体检测
-  helmet_config: "simple-demo3/configs/pgie_config_helmet.txt"  # 安全帽
-  vest_config: "simple-demo3/configs/pgie_config_vest.txt"      # 反光衣
+  pgie_config: "configs/pgie_config_yolo26n.txt"   # 人体检测
+  helmet_config: "configs/pgie_config_helmet.txt"  # 安全帽
+  vest_config: "configs/pgie_config_vest.txt"      # 反光衣
 
 # -----------------------------------------------------------------------------
 # 摄像头列表
@@ -27,9 +28,8 @@ cameras:
   - id: "1363"
     name: "Mobile Camera 1363"
     type: "rtsp"
-    rtsp_url: "rtsp://118.140.234.166:8554/dahua1000352"
-    # rtsp://118.140.234.166:8554/dahua1000330
-    # rtsp_url: "rtsp://118.140.234.166:8554/dahua1000330"
+    # rtsp_url: "rtsp://118.140.234.166:8554/dahua1000352"
+    rtsp_url: "rtsp://118.140.234.166:8554/dahua1000330"
     enabled: true
 
 # -----------------------------------------------------------------------------
@@ -41,6 +41,8 @@ alert:
   cooldown_seconds: 10           # 同一摄像头两次告警的最小间隔（秒）
   min_detection_count: 3         # 连续检测到违规的帧数阈值（防止单帧误报）
   save_frame_overlay: false      # 是否在证据帧上叠加摄像头名称/时间水印（证据帧已启用，告警带图）
+  helmet_conf_threshold: 0.5     # 头盔框匹配 person 的最低置信度
+  vest_conf_threshold: 0.8       # 反光衣框匹配 person 的最低置信度
 
   webhook:
     # url: "http://192.168.1.24:6034/protal/smoking-alarm/webhook"

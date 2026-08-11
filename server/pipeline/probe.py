@@ -4,7 +4,7 @@ DeepStream 探针 → 告警状态机桥
 把三模型整帧检测（person / helmet / vest）的 batch 元数据翻译成
 server.metadata.ObjectMeta 列表，按 source_id 喂给对应的 AlertManager。
 
-流程（复用 simple-demo3/two_stage_demo.py 已验证的空间关联逻辑）:
+流程（空间关联逻辑源自 simple-demo3/two_stage_demo.py 已验证方案）:
   - 三模型都是 process-mode=1 整帧检测器，结果按 gie-unique-id 挂在帧级:
       uid=1  person（yolo26n, 只出 person）
       uid=3  helmet（head/helmet）
@@ -39,10 +39,6 @@ HEAD_CLASS_ID = 0
 VEST_CLASS_ID = 0     # vest: 0=vest(已穿), 1=no_vest(未穿)
 NO_VEST_CLASS_ID = 1
 
-# 关联 person 时要求的最低置信度（低于则视为噪声，不参与状态判定）
-HELMET_CONF_THRESHOLD = 0.5
-VEST_CONF_THRESHOLD = 0.5
-
 
 class SafetyProbe(BatchMetadataOperator):
     """逐帧: 空间关联 → ObjectMeta 列表 → 对应摄像头的 AlertManager.handle()。
@@ -51,17 +47,25 @@ class SafetyProbe(BatchMetadataOperator):
         alert_managers: {source_id(int): AlertManager}，每路摄像头一个状态机。
         executor: ThreadPoolExecutor，透传给 AlertManager 用于异步 webhook。
         frame_cache: 可选 FrameCache，触发告警时取该 source 最新原始帧作 snapshot。
+        helmet_conf_threshold: 头盔框空间关联 person 的最低置信度（低于视为噪声）。
+        vest_conf_threshold: 反光衣框空间关联 person 的最低置信度。
     """
 
     def __init__(self, alert_managers: dict,
                  executor: ThreadPoolExecutor | None = None,
-                 frame_cache=None):
+                 frame_cache=None,
+                 helmet_conf_threshold: float = 0.5,
+                 vest_conf_threshold: float = 0.5):
         super().__init__()
         self._managers = alert_managers
         self._executor = executor
         # 证据帧缓存（FrameCache）: 触发告警时取该 source 最新原始帧作 snapshot。
         # None 表示未启用证据帧采集，行为与之前一致（frame_base64=null）。
         self._frame_cache = frame_cache
+        # 空间关联置信度门槛（来自 server/config.yaml alert.*，须 >= INI 的
+        # pre-cluster-threshold，否则低置信度框已在模型侧被裁掉、探针看不到）
+        self._helmet_conf_threshold = helmet_conf_threshold
+        self._vest_conf_threshold = vest_conf_threshold
 
     def handle_metadata(self, batch_meta):
         for frame_meta in batch_meta.frame_items:
@@ -81,10 +85,10 @@ class SafetyProbe(BatchMetadataOperator):
                     continue
 
                 h, h_conf = self._helmet_status(
-                    self._matched_conf(obj, helmet_boxes, HELMET_CONF_THRESHOLD)
+                    self._matched_conf(obj, helmet_boxes, self._helmet_conf_threshold)
                 )
                 v, v_conf = self._vest_status(
-                    self._matched_conf(obj, vest_boxes, VEST_CONF_THRESHOLD)
+                    self._matched_conf(obj, vest_boxes, self._vest_conf_threshold)
                 )
 
                 attrs = []

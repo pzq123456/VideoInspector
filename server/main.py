@@ -20,7 +20,10 @@
 """
 
 import argparse
+import os
+import re
 import sys
+import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from multiprocessing import Process
 from pathlib import Path
@@ -85,6 +88,11 @@ def _validate_config(config: dict, path: Path):
 
     if "alert" not in config:
         errors.append("缺少 'alert' 节")
+    else:
+        for key in ("helmet_conf_threshold", "vest_conf_threshold"):
+            val = config["alert"].get(key)
+            if val is not None and not (isinstance(val, (int, float)) and 0.0 <= val <= 1.0):
+                errors.append(f"alert.{key} 必须是 0~1 的置信度阈值，当前: {val!r}")
 
     if errors:
         raise ValueError(f"配置校验失败 ({path}):\n  " + "\n  ".join(errors))
@@ -95,21 +103,69 @@ def _resolve(base: Path, p: str) -> str:
     return p if Path(p).is_absolute() else str(base / p)
 
 
+# nvinfer 解析 INI 内相对路径时基于进程 CWD，这里在启动时把模型路径显式
+# 锚定到项目根（_PROJECT_ROOT，开发容器=/workspaces/VideoInspector，镜像=/app），
+# 使同一份可移植 INI 两端通用，不依赖启动目录。
+_MODEL_PATH_KEYS = ("onnx-file", "model-engine-file", "labelfile-path", "custom-lib-path")
+# 运行期必须存在、缺失即报错（onnx-file 仅用于重建引擎，不在此列）
+_REQUIRED_PATH_KEYS = ("model-engine-file", "custom-lib-path", "labelfile-path")
+
+_patched_dir: Path | None = None
+
+
+def _anchor_ini_config(src: Path) -> str:
+    """把 INI 内相对项目根的模型路径补全为绝对路径，返回 patched 文件路径。
+
+    fail fast: 锚定后校验运行期必需的引擎/parser/标签文件存在，
+    缺失时给出清晰报错（而非 nvinfer 的模糊告警）。
+    """
+    global _patched_dir
+    if _patched_dir is None:
+        _patched_dir = Path(tempfile.mkdtemp(prefix="safety-configs-"))
+
+    out_lines, resolved = [], {}
+    for raw in src.read_text(encoding="utf-8").splitlines():
+        m = re.match(r"^([A-Za-z0-9_-]+)=(.*)$", raw.strip())
+        if m and m.group(1) in _MODEL_PATH_KEYS:
+            val = m.group(2).strip()
+            if val and not Path(val).is_absolute():
+                val = str(_PROJECT_ROOT / val)
+                raw = f"{m.group(1)}={val}"
+            resolved[m.group(1)] = val
+        out_lines.append(raw)
+
+    missing = [
+        f"{k}={v}" for k, v in resolved.items()
+        if k in _REQUIRED_PATH_KEYS and v and not Path(v).exists()
+    ]
+    if missing:
+        raise FileNotFoundError(
+            f"{src.name} 引用的模型产物缺失（请确认根目录 models/ 已拷全）:\n  "
+            + "\n  ".join(missing)
+        )
+
+    out = _patched_dir / src.name
+    out.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
+    return str(out)
+
+
 # ============================================================================
 # 子进程: 构建并运行 DeepStream pipeline
 # ============================================================================
 def _serve(config: dict):
+    log_cfg = config.get("log") or {}
     logger = setup_logger(
         name="safety_server",
-        level=(config.get("log") or {}).get("level", "INFO"),
-        log_file=(config.get("log") or {}).get("file"),
+        level=log_cfg.get("level", "INFO"),
+        # 部署环境用 SAFETY_LOG_FILE 覆盖（容器内映射到宿主挂载卷）
+        log_file=os.environ.get("SAFETY_LOG_FILE") or log_cfg.get("file"),
     )
     logger.info("startup safety_detection_server")
 
     model = config["model"]
-    pgie_config = _resolve(_PROJECT_ROOT, model["pgie_config"])
-    helmet_config = _resolve(_PROJECT_ROOT, model["helmet_config"])
-    vest_config = _resolve(_PROJECT_ROOT, model["vest_config"])
+    pgie_config = _anchor_ini_config(Path(_resolve(_PROJECT_ROOT, model["pgie_config"])))
+    helmet_config = _anchor_ini_config(Path(_resolve(_PROJECT_ROOT, model["helmet_config"])))
+    vest_config = _anchor_ini_config(Path(_resolve(_PROJECT_ROOT, model["vest_config"])))
 
     # Webhook 推送器（全局共享一个）
     webhook_cfg = config.get("alert", {}).get("webhook", {})
@@ -127,6 +183,9 @@ def _serve(config: dict):
     # 每路摄像头一个 AlertManager（source_id 即 nvstreammux 的 pad 序）
     alert_cfg = config.get("alert", {})
     target_classes = alert_cfg.get("target_classes", ["no_helmet", "no_vest"])
+    # 空间关联置信度门槛（须 >= INI 的 pre-cluster-threshold=0.25）
+    helmet_conf_threshold = float(alert_cfg.get("helmet_conf_threshold", 0.5))
+    vest_conf_threshold = float(alert_cfg.get("vest_conf_threshold", 0.5))
     cameras = [c for c in config.get("cameras") or [] if c.get("enabled", True)]
     alert_managers = {}
     for i, cam in enumerate(cameras):
@@ -190,7 +249,9 @@ def _serve(config: dict):
 
     p.attach("vest", Probe("safety-probe",
                            SafetyProbe(alert_managers, executor=executor,
-                                       frame_cache=frame_cache)))
+                                       frame_cache=frame_cache,
+                                       helmet_conf_threshold=helmet_conf_threshold,
+                                       vest_conf_threshold=vest_conf_threshold)))
     p.attach("vest", "measure_fps_probe", name="fps-probe")
 
     logger.info("pipeline started cameras={} batch={}", num, num)

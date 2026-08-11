@@ -1,0 +1,11 @@
+# 构建上下文排除项（context = 项目根目录）
+.git
+.gitignore
+__pycache__/
+*.pyc
+*.pyo
+logs/
+alerts/
+local/
+tmp/
+.devcample/

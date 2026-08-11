@@ -1,46 +1,21 @@
-# =============================================================================
-# docker-compose.yml — 抽烟检测服务一键部署
-# =============================================================================
-# 使用方式（在 deploy/ 目录下操作）：
-#
-#   启动    docker compose up -d
-#   查看    docker compose logs -f
-#   重启    docker compose restart
-#   停止    docker compose down
-#   重建    docker compose build --no-cache && docker compose up -d
-#
-# 换模型：替换 models/ 下的文件 → 改 config.yaml 中 model.path → restart
-# 改配置：编辑 config.yaml → restart
-# 改代码：docker compose build --no-cache → up -d
-# =============================================================================
-
 services:
   detector:
     build:
-      context: ..                    # 项目根目录
+      context: ..
       dockerfile: Dockerfile
-    image: smoke-detector:latest
-    container_name: smoke-detector
+    image: safety-detector:latest
+    container_name: safety-detector
     runtime: nvidia
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
-    # extra_hosts:
-    #   - "host.docker.internal:host-gateway"   # 让容器能访问宿主机（webhook 测试用）
+      - SAFETY_LOG_FILE=/logs/server.log   # 日志落到宿主机映射的 deploy/logs/
+    shm_size: "1g"
+
     volumes:
-      # -- 配置（只读） --
-      - ./config.yaml:/app/server/config.yaml:ro
-
-      # -- 模型目录（只读） —
-      #     模型放 deploy/models/，config.yaml 中写 /models/<文件名>
-      - ./models:/models:ro
-
-      # -- 训练产出（只读，可选） —
-      #     不拷贝模型，直接在 config.yaml 中写 /runs/detect/.../best.pt
-      - ../runs:/runs:ro
-
-      # -- 日志（读写） --
       - ./logs:/logs
+
     ports:
-      - "18082:8080"            # 视频流预览端口 左侧为对外服务端口 右侧为 docker 内部
+      - "18003:18003/tcp"
+      - "18004-18020:18004-18020/udp"
     restart: unless-stopped
