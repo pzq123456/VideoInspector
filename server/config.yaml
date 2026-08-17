@@ -76,17 +76,17 @@ alert:
 # -----------------------------------------------------------------------------
 # RTSP 输出（替代原 MJPEG 预览；注释掉 output 节即关闭）
 # -----------------------------------------------------------------------------
-# 每路摄像头独立输出：相机 i → 端口 rtsp_port+i，挂载点 {mount_prefix}/{camera_id}。
-#   播放地址（示例，本地端口转发后）:
-#     rtsp://localhost:18003/cam/1363
-#     rtsp://localhost:18004/cam/1384
+# 单端口 RTSP 服务：所有摄像头共用 rtsp_port，通过挂载点路径区分。
+#   播放地址（示例）:
+#     rtsp://localhost:8554/cam/1363
+#     rtsp://localhost:8554/cam/1384
 #     ... 依此类推（camera_id 与 cameras 列表一一对应）
 output:
-  rtsp_port: 18003          # 基础端口，相机 i 输出端口 = rtsp_port + i
-  mount_prefix: /cam        # 挂载点前缀，每路 = /cam/<camera_id>
-  codec: h264               # 输出编码: h264 / h265
-  bitrate: 4000000          # 编码码率 (bps)
-  idrinterval: 30           # 关键帧间隔（帧）
+  rtsp_port: 8554            # 单一 RTSP 服务端口（所有摄像头共用）
+  mount_prefix: /cam         # 挂载点前缀，每路 = /cam/<camera_id>
+  codec: h264                # 输出编码: h264 / h265
+  bitrate: 4000000           # 编码码率 (bps)
+  idrinterval: 30            # 关键帧间隔（帧）
 
 # -----------------------------------------------------------------------------
 # 日志参数

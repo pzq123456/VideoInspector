@@ -17,7 +17,8 @@ server/
 ├── metadata.py             # 数据契约：ObjectMeta / AttributeMeta（探针 → 状态机桥）
 ├── pipeline/
 │   ├── probe.py            # SafetyProbe：三模型检测 → 空间关联 → 违规属性 + nvdsosd 上色 → AlertManager
-│   └── frame_cache.py      # 证据帧采集：tee → appsink 缓存最新已渲染帧（FrameCache/Retriever）
+│   ├── frame_cache.py      # 证据帧采集：每路 tee → appsink 缓存最新已渲染帧（FrameCache/Retriever）
+│   └── rtsp_server.py      # 单端口 RTSP 输出（GstRtspServer，/cam/{id} 多挂载点）
 ├── alert/
 │   ├── manager.py          # 告警管理（冷却 + 连续帧确认 + 异步 webhook 推送）
 │   └── webhook.py          # Webhook HTTP POST 推送
@@ -44,10 +45,10 @@ python -m server.main --config my_config.yaml
 RTSP 源×N → nvstreammux(batch=N) → nvinfer(pgie: yolo26n 人体检测, uid=1)
                                    → nvinfer(helmet: head/helmet 安全帽检测, uid=3)
                                    → nvinfer(vest: vest/no_vest 反光衣检测, uid=4)
-                                   → nvdsosd → tee → [nvstreamdemux → RTSP 输出×N | fakesink]
-                                                └── queue → nvvideoconvert → appsink（证据帧缓存, 按 source_id）
-                                                    ↑
-                                          SafetyProbe（挂在 vest 后，上色 + 桥接）
+                                   → nvstreamdemux → 每路:
+                                        nvdsosd → tee → [ shmsink(→ 单端口 RTSP server) | appsink(证据帧缓存) ]
+                                            ↑
+                                  SafetyProbe（挂在 vest 后，上色 + 桥接）
 ```
 
 三个模型都是**整帧检测器**（process-mode=1），对同一帧各自独立推理。探针做
@@ -81,7 +82,8 @@ RTSP 源×N → nvstreammux(batch=N) → nvinfer(pgie: yolo26n 人体检测, uid
 | `enabled` | bool | 是否启用 |
 
 > **多路支持**：引擎为动态 batch（1~12），mux/nvinfer 的 `batch-size` 自动取
-> `len(cameras)`。每路摄像头独立 AlertManager + 独立 RTSP 预览输出。
+> `len(cameras)`。每路摄像头独立 AlertManager + 独立 OSD 渲染（demux 后每路独立，
+> 杜绝跨流污染）+ 独立证据帧缓存。
 
 ### alert — 告警参数
 
@@ -104,20 +106,20 @@ RTSP 源×N → nvstreammux(batch=N) → nvinfer(pgie: yolo26n 人体检测, uid
 
 ### output — RTSP 输出（可选，替代原 MJPEG 预览）
 
-每路摄像头独立预览：相机 `i` → 端口 `rtsp_port + i`，挂载点 `{mount_prefix}/{camera_id}`。
+单端口 RTSP 服务：所有摄像头共用 `rtsp_port`，通过挂载点路径区分。
 
 | 字段 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `rtsp_port` | int | `18003` | 基础端口，相机 i 输出端口 = `rtsp_port + i` |
+| `rtsp_port` | int | `8554` | 单一 RTSP 服务端口（所有摄像头共用） |
 | `mount_prefix` | string | `/cam` | 挂载点前缀，每路 = `/cam/<camera_id>` |
 | `codec` | string | `h264` | `h264` / `h265` |
 | `bitrate` | int | `4000000` | 编码码率 (bps) |
 | `idrinterval` | int | `30` | 关键帧间隔（帧） |
 
-示例（6 路）：`rtsp://localhost:18003/cam/1363`、`rtsp://localhost:18004/cam/1384` … 依此类推。
-每个 `nvrtspoutsinkbin` 自带一个 RTSP server，因此必须独占端口；如需固定某路端口可调整 cameras 顺序。
+示例（6 路）：`rtsp://localhost:8554/cam/1363`、`rtsp://localhost:8554/cam/1384` … 依此类推。
+单端口由 `GstRtspServer`（PyGObject）承载，每路通过 shm 桥接（`shmsink` → `shmsrc`）。
 
-注释掉整个 `output` 节即关闭 RTSP 输出（改用 fakesink 丢弃，检测/告警不受影响）。
+注释掉整个 `output` 节即关闭 RTSP 输出（检测/告警仍照常）。
 
 ### log — 日志参数
 
@@ -180,14 +182,19 @@ RTSP 源×N → nvstreammux(batch=N) → nvinfer(pgie: yolo26n 人体检测, uid
   executor 线程池 + daemon 线程 fire-and-forget。
 - **每路摄像头独立状态机**：`dict[source_id → AlertManager]`，`source_id`
   即 `nvstreammux` 的 pad 序号。
-- **证据帧 = 实时预览帧**：单路 nvdsosd 位于 tee 之前，实时预览与证据帧共享同一
-  渲染源，保证证据帧与操作者所见一致（违规红 / 合规绿 / 未知蓝）。
+- **证据帧 = 实时预览帧**：每路在 `nvstreamdemux` 后独立 `nvdsosd` 渲染，
+  实时预览与证据帧共享同一渲染源，保证证据帧与操作者所见一致
+  （违规红 / 合规绿 / 未知蓝），且彻底隔离跨流污染。
+- **单端口 RTSP 输出**：所有摄像头共用一个 `GstRtspServer` 端口，
+  `/cam/{camera_id}` 路径区分，客户端配置统一。
 
 ## 稳定性说明
 
 - Ctrl+C → 子进程终止，干净退出。
 - Webhook 失败自动重试（`retries` 次），异常不阻塞检测管线。
 - RTSP 断线由 `nvurisrcbin` 内部处理。
+- 单端口 RTSP 输出依赖 PyGObject（`python3-gi`）+ `gir1.2-gst-rtsp-server-1.0`
+  （容器已装）；未启用 `output` 节时无此依赖。
 
 ## 已知限制 / 后续项
 

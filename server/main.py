@@ -12,12 +12,14 @@
     3. 创建 Webhook 推送器 + 每路摄像头一个 AlertManager（source_id → manager）
     4. 构建 DeepStream pipeline:
            RTSP 源×N → nvstreammux(batch=N) → nvinfer(pgie: person) → nvinfer(helmet)
-                     → nvinfer(vest) → nvdsosd → tee → [nvstreamdemux → RTSP 输出×N | fakesink]
-                                                   └── queue → nvvideoconvert → appsink(证据帧缓存, 按 source_id)
+                     → nvinfer(vest) → nvstreamdemux → 每路:
+                           nvdsosd → tee → [ shmsink(→ 单端口 RTSP server) | appsink(证据帧缓存) ]
      5. SafetyProbe 挂在 vest，把三模型检测元数据翻译成 ObjectMeta 喂给
         对应摄像头的 AlertManager（冷却 + 连续帧确认 + 异步 webhook 推送），
-        同时给对象上色（nvdsosd 原生渲染）；触发告警时带上缓存的最新已渲染帧，
-        executor 线程 JPEG 编码 → payload。
+        同时给对象上色（nvdsosd 原生渲染，demux 后每路独立，杜绝跨流污染）；
+        触发告警时带上该路缓存的最新已渲染帧，executor 线程 JPEG 编码 → payload。
+     6. 单端口 RTSP 输出（GstRtspServer）：所有摄像头共用 rtsp_port，
+        通过 /cam/{camera_id} 区分路径。
 """
 
 import argparse
@@ -43,10 +45,8 @@ from server.alert.manager import AlertManager
 from server.alert.webhook import WebhookAlerter
 from server.pipeline.frame_cache import FrameCache, add_evidence_capture
 from server.pipeline.probe import SafetyProbe
+from server.pipeline.rtsp_server import SinglePortRtspServer
 from server.utils.logger import setup_logger
-
-# nvrtspoutsinkbin 的 codec 是枚举属性，pyservicemaker 只接受 int 值
-CODEC_MAP = {"h264": 1, "h265": 2, "mpeg4": 3}
 
 
 # ============================================================================
@@ -221,48 +221,57 @@ def _serve(config: dict):
     p.add("nvinfer", "helmet", {"config-file-path": helmet_config, "batch-size": num})
     p.add("nvinfer", "vest", {"config-file-path": vest_config, "batch-size": num})
 
-    # 证据帧采集：nvdsosd 后 tee 分流，缓存每路最新**已渲染**帧（分支在 frame_cache 模块建好）
+    # vest 后立即拆流：之后每路独立渲染/采集/输出，彻底隔离跨流污染
+    p.add("nvstreamdemux", "demux")
+
+    # RTSP 输出参数（单端口 + 每路不同 mount path）
+    codec = (out or {}).get("codec", "h264")
+    bitrate = (out or {}).get("bitrate", 4000000)
+    idrinterval = (out or {}).get("idrinterval", 30)
+    mount_prefix = (out or {}).get("mount_prefix", "/cam")
+    rtsp_port = int((out or {}).get("rtsp_port", 8554))
+    enc_factory = "nvv4l2h265enc" if codec == "h265" else "nvv4l2h264enc"
+    parser_factory = "h265parse" if codec == "h265" else "h264parse"
+
     frame_cache = FrameCache()
-    tee_name = add_evidence_capture(p, frame_cache, gpu_id=0)
+    rtsp_mounts: dict[str, str] = {}
 
-    # 单路 nvdsosd 渲染器：始终位于 tee 之前，实时预览与证据帧共享同一渲染源，
-    # 保证证据帧与操作者所见一致（违规红 / 合规绿 / 未知蓝由 SafetyProbe 上色）。
-    p.add("nvdsosd", "osd", {
-        "gpu-id": 0,
-        "process-mode": 1,  # GPU 模式
-        "display-bbox": 1,
-        "display-text": 1,
-    })
+    for i, cam in enumerate(cameras):
+        # 每路独立 nvdsosd：SafetyProbe 上色（metadata 随 demux 保留到本路）
+        p.add("nvdsosd", f"osd{i}", {
+            "gpu-id": 0,
+            "process-mode": 1,  # GPU 模式
+            "display-bbox": 1,
+            "display-text": 1,
+        })
+        # 证据帧 tee 分支：appsink 缓存该路已渲染帧（branch 在 frame_cache 模块建好）
+        tee = add_evidence_capture(p, frame_cache, source_id=i, gpu_id=0, suffix=str(i))
+        p.link((f"demux", f"osd{i}"), ("src_%u", ""))
+        p.link(f"osd{i}", tee)
 
-    if out:
-        # 多路输出：batch 帧 → nvstreamdemux 拆成每路独立帧 → 每路一个 RTSP 输出。
-        # 每个 nvrtspoutsinkbin 自带一个 RTSP server，必须独占端口：
-        #   camera i → port = rtsp_port + i, mount = {mount_prefix}/{camera_id}
-        p.add("nvstreamdemux", "demux")
-        base_port = int(out.get("rtsp_port", 18003))
-        mount_prefix = out.get("mount_prefix", "/cam")
-        codec_val = CODEC_MAP.get(out.get("codec", "h264"), 1)
-        bitrate = out.get("bitrate", 4000000)
-        idrinterval = out.get("idrinterval", 30)
-        for i, cam in enumerate(cameras):
-            p.add("nvrtspoutsinkbin", f"rtspout{i}", {
-                "rtsp-port": base_port + i,
-                "rtsp-mount-point": f"{mount_prefix}/{cam['id']}",
-                "codec": codec_val,
+        if out:
+            shm_socket = f"/tmp/vi_cam_{i}"
+            p.add("nvvideoconvert", f"rtsp-conv{i}", {"gpu-id": 0, "compute-hw": 1})
+            p.add("capsfilter", f"rtsp-caps{i}", {
+                "caps": "video/x-raw(memory:NVMM), format=NV12",
+            })
+            p.add(enc_factory, f"enc{i}", {
                 "bitrate": bitrate,
                 "idrinterval": idrinterval,
-                "sync": 0,
+                "insert-sps-pps": 1,
             })
-            # 请求 nvstreamdemux 的 src_%u request pad（请求顺序 = 源序号），连到该路输出
-            p.link(("demux", f"rtspout{i}"), ("src_%u", ""))
-            print(f">>> 相机 {cam['id']} RTSP 输出: "
-                  f"rtsp://localhost:{base_port + i}{mount_prefix}/{cam['id']}")
-        p.link("mux", "pgie", "helmet", "vest", "osd", tee_name)
-        p.link(tee_name, "demux")
-    else:
-        p.add("fakesink", "sink", {"sync": False, "async": 0})
-        p.link("mux", "pgie", "helmet", "vest", "osd", tee_name)
-        p.link(tee_name, "sink")
+            p.add(parser_factory, f"parse{i}")
+            p.add("shmsink", f"shm{i}", {
+                "socket-path": shm_socket,
+                "wait-for-connection": False,
+                "sync": False,
+                "async": 0,
+            })
+            p.link(tee, f"rtsp-conv{i}", f"rtsp-caps{i}",
+                   f"enc{i}", f"parse{i}", f"shm{i}")
+            rtsp_mounts[f"{mount_prefix}/{cam['id']}"] = shm_socket
+
+    p.link("mux", "pgie", "helmet", "vest", "demux")
 
     p.attach("vest", Probe("safety-probe",
                            SafetyProbe(alert_managers, executor=executor,
@@ -271,10 +280,20 @@ def _serve(config: dict):
                                        vest_conf_threshold=vest_conf_threshold)))
     p.attach("vest", "measure_fps_probe", name="fps-probe")
 
+    # 单端口 RTSP 输出服务：所有摄像头共用 rtsp_port，路径区分 /cam/{camera_id}
+    rtsp_server = None
+    if rtsp_mounts:
+        rtsp_server = SinglePortRtspServer(rtsp_port, rtsp_mounts, codec=codec)
+        rtsp_server.start()
+        for mount in rtsp_mounts:
+            print(f">>> RTSP 输出: rtsp://localhost:{rtsp_port}{mount}")
+
     logger.info("pipeline started cameras={} batch={}", num, num)
     try:
         p.start().wait()
     finally:
+        if rtsp_server is not None:
+            rtsp_server.stop()
         executor.shutdown(wait=False, cancel_futures=True)
 
 
