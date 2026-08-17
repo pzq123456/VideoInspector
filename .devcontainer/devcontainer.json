@@ -7,6 +7,7 @@
         "-e", "DISPLAY=host.docker.internal:0.0"
     ],
     "remoteUser": "root",
+    "postCreateCommand": "git config --global core.filemode false && git config --global core.autocrlf false",
     "features": {
         "ghcr.io/anthropics/devcontainer-features/claude-code:1.0": {}
     },
