@@ -14,7 +14,7 @@
 # 生产镜像 /app 通用）。引擎/parser 复用根目录 models/ 已有产物。
 # -----------------------------------------------------------------------------
 model:
-  pgie_config: "configs/pgie_config_yolo26n.txt"   # 人体检测
+  pgie_config: "configs/pgie_config_person.txt"    # 人体检测
   helmet_config: "configs/pgie_config_helmet.txt"  # 安全帽
   vest_config: "configs/pgie_config_vest.txt"      # 反光衣
 

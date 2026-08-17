@@ -13,6 +13,8 @@ services:
     shm_size: "1g"
 
     volumes:
+      - ../models:/app/models     # 模型产物（引擎/parser/labels）——宿主机构建, 重启容器即加载新模型
+      - ../configs:/app/configs   # 生成的 nvinfer 配置
       - ./logs:/logs
 
     ports:
