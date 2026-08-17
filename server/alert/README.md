@@ -3,39 +3,46 @@
 本文档对应 `server/alert/manager.py`（状态机）+ `server/alert/webhook.py`（推送）。
 
 每路摄像头一个独立的 `AlertManager` 实例（`main.py` 中 `dict[source_id → AlertManager]`），
-内部只有两个变量：`_consecutive_hits`（连续命中帧数）和 `_last_alert_time`（上次告警时间）。
+内部维护一个**显式状态机** `AlertState`（`IDLE` / `ARMING` / `COOLDOWN`）。
 
 ## 1. 状态机
 
 `handle(objects, snapshot, executor)` 每帧调用一次，逻辑如下：
 
 ```
-                      ┌─ 按 target_classes 过滤（class_name 或 attributes.name 命中）
-                      │
-             有违规实体？───── 否 ──→ hits -= 1（缓慢衰减，容忍偶尔丢帧）──→ 无告警
-                      │ 是
-                      ▼
-               hits += 1
-                      │
-        hits >= min_detection_count？── 否 ──→ 仍在计数 ──→ 无告警
-                      │ 是
-                      ▼
-        now - last_alert_time >= cooldown_seconds？── 否 ──→ 冷却中，hits 归零 ──→ 无告警
-                      │ 是
-                      ▼
-        🚨 触发告警（hits 归零，更新 last_alert_time）
-          ├─ 记录日志（代表对象 = 置信度最高者）
-          ├─ executor.submit(_build_and_send)   # 检测线程立即返回，只做决策
-          └─ return True
+        ┌─ COOLDOWN 且未过冷却？── 是 ──→ 直接返回（不判定、不计数）
+        │            │ 否（冷却结束）
+        │            ▼
+        │        回到 IDLE（hits 清零，重新武装）
+        │
+        ▼
+  按 target_classes 过滤（class_name 或 attributes.name 命中）
+        │
+  有违规实体？──── 否 ──→ ARMING 中 hits -= 1（缓慢衰减，容忍偶尔丢帧）
+        │                       减到 0 → 回到 IDLE
+        │ 是
+        ▼
+  进入 ARMING，hits += 1
+        │
+  hits >= min_detection_count？── 否 ──→ 继续累计 ──→ 无告警
+        │ 是
+        ▼
+  🚨 触发告警
+    ├─ 记录日志（代表对象 = 置信度最高者）
+    ├─ executor.submit(_build_and_send)   # 检测线程立即返回，只做决策
+    └─ 进入 COOLDOWN（hits 清零，记录 cooldown_until = monotonic() + cooldown_seconds）
 ```
 
 要点：
 
+- **显式三态**：`IDLE`（无近期违规）→ `ARMING`（累计连续违规帧）→ `COOLDOWN`
+  （告警后冷却）。相比旧的「两个变量」写法，状态迁移一目了然。
+- **冷却期置顶判定**：冷却期内直接返回，不再逐帧计数/打印误导性 `hits` 日志；
+  冷却结束后回到 `IDLE`，需重新连续命中 `min_detection_count` 帧才会再触发。
 - **连续帧确认**：hits 是"连续多少帧**出现至少一个**违规实体"的全局计数（按摄像头，
-  不按人）。只有 `hits >= min_detection_count` 才进入触发判定，防止单帧误报。
-- **冷却期**：`cooldown_seconds` 内即使 hits 再次达标也会被拦下并**归零**，
-  即冷却结束后还要重新连续命中 `min_detection_count` 帧才会再触发。
+  不按人）。只有 `hits >= min_detection_count` 才触发，防止单帧误报。
 - **衰减**：无违规帧时 hits 每帧 `-1`（不立即清零），容忍推理偶发丢帧。
+- **单调时钟**：冷却用 `time.monotonic()`，不受系统 NTP 校时跳变影响。
 - 目标匹配是**两级**的：`ObjectMeta.class_name` 直接命中，或任意
   `AttributeMeta.name` 命中（两阶段检测：`person` 携带 `no_helmet`/`no_vest` 属性）。
 
@@ -59,8 +66,8 @@
         │  executor.submit(_build_and_send, snapshot, objects, ts)
         ▼
 executor 线程池（_build_and_send）
-  - 画触发告警的人物框 + 违规标签（仅 snapshot 非空）
-  - 可选水印
+  - snapshot 已由 nvdsosd 原生渲染（含检测框 + 违规标签），无需再画框
+  - 可选水印（save_frame_overlay）
   - simplejpeg 编码 JPEG（C 扩展，释放 GIL）
         │  启动 daemon 线程 fire-and-forget
         ▼
@@ -68,7 +75,8 @@ daemon 线程（_send_payload）
   - base64 编码 → 组装 payload → webhook.send()（HTTP POST）
 ```
 
-- `snapshot` 来自 `FrameCache`（`pipeline/frame_cache.py`），是告警瞬间该路摄像头最新原始帧；
+- `snapshot` 来自 `FrameCache`（`pipeline/frame_cache.py`），是告警瞬间该路摄像头最新
+  **已渲染帧**（nvdsosd 原生画框，与实时预览一致）；
   缓存尚未就绪时为 `None`，此时仍照常推送，`frame_base64=null`，告警不丢。
 - Webhook 失败自动重试，异常只记日志，不影响管线。
 

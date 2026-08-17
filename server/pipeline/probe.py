@@ -2,7 +2,8 @@
 DeepStream 探针 → 告警状态机桥
 
 把三模型整帧检测（person / helmet / vest）的 batch 元数据翻译成
-server.metadata.ObjectMeta 列表，按 source_id 喂给对应的 AlertManager。
+server.metadata.ObjectMeta 列表，按 source_id 喂给对应的 AlertManager；
+同时给底层对象上色（nvdsosd 原生渲染，证据帧与实时预览共享同一渲染源）。
 
 流程（空间关联逻辑源自 simple-demo3/two_stage_demo.py 已验证方案）:
   - 三模型都是 process-mode=1 整帧检测器，结果按 gie-unique-id 挂在帧级:
@@ -10,23 +11,37 @@ server.metadata.ObjectMeta 列表，按 source_id 喂给对应的 AlertManager�
       uid=3  helmet（head/helmet）
       uid=4  vest（vest/no_vest）
   - 第一趟: 收集 helmet / vest 框的普通数值（class_id/conf/中心点），
-    不持有元数据包装器（跨 pass 持有会段错误）。
+    不持有元数据包装器（跨 pass 持有会段错误），同时给这些框上色。
   - 第二趟: 每个 person 做空间关联（检测框中心落在 person 框内），
-    违规翻译为 AttributeMeta('no_helmet') / AttributeMeta('no_vest')。
+    违规翻译为 AttributeMeta('no_helmet') / AttributeMeta('no_vest')，
+    并按状态给 person 框上色（红=违规 / 绿=双达标 / 蓝=有维度未知），
+    违规者叠加文本标签（nvdsosd 的 per-object text_params）。
+
+渲染约定（证据帧 = 完整 OSD 渲染帧，与实时预览一致）:
+  - no_vest 或未戴帽(no_helmet) 的人 → 红色框 + 违规标签
+  - vest 且戴帽(helmet) 的人        → 绿色框
+  - 任一项未关联上                 → 蓝色框
+  - head/helmet 框                → 红=head(未戴), 绿=helmet(已戴)
+  - no_vest/vest 框               → 红=no_vest, 绿=vest
 
 约束:
   - 本探针在 GStreamer 流线程运行，只做轻量决策；
     JPEG / base64 / HTTP 由 AlertManager 内部 executor + daemon 线程处理。
+  - 上色必须在同一 pass 内完成（不能把元数据包装器存到 list 跨 pass 复用）。
 """
 
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 
-from pyservicemaker import BatchMetadataOperator
+from pyservicemaker import BatchMetadataOperator, osd
 from loguru import logger
 
 from server.metadata import AttributeMeta, ObjectMeta
+
+RED = osd.Color(1.0, 0.0, 0.0, 1.0)    # 违规（no_helmet 或 no_vest）
+GREEN = osd.Color(0.0, 1.0, 0.0, 1.0)  # 双达标（vest 且 helmet）
+BLUE = osd.Color(0.0, 0.0, 1.0, 1.0)   # 有维度未知
 
 # 各整帧检测器的 gie-unique-id（探针按此区分对象来源，而非 class_id）
 PERSON_UID = 1      # pgie (yolo26n)
@@ -46,7 +61,7 @@ class SafetyProbe(BatchMetadataOperator):
     Args:
         alert_managers: {source_id(int): AlertManager}，每路摄像头一个状态机。
         executor: ThreadPoolExecutor，透传给 AlertManager 用于异步 webhook。
-        frame_cache: 可选 FrameCache，触发告警时取该 source 最新原始帧作 snapshot。
+        frame_cache: 可选 FrameCache，触发告警时取该 source 最新已渲染帧作 snapshot。
         helmet_conf_threshold: 头盔框空间关联 person 的最低置信度（低于视为噪声）。
         vest_conf_threshold: 反光衣框空间关联 person 的最低置信度。
     """
@@ -59,7 +74,7 @@ class SafetyProbe(BatchMetadataOperator):
         super().__init__()
         self._managers = alert_managers
         self._executor = executor
-        # 证据帧缓存（FrameCache）: 触发告警时取该 source 最新原始帧作 snapshot。
+        # 证据帧缓存（FrameCache）: 触发告警时取该 source 最新已渲染帧作 snapshot。
         # None 表示未启用证据帧采集，行为与之前一致（frame_base64=null）。
         self._frame_cache = frame_cache
         # 空间关联置信度门槛（来自 server/config.yaml alert.*，须 >= INI 的
@@ -69,16 +84,23 @@ class SafetyProbe(BatchMetadataOperator):
 
     def handle_metadata(self, batch_meta):
         for frame_meta in batch_meta.frame_items:
-            # 第一趟: 收集 helmet/vest 检测框的普通数值，避免持有元数据包装器
+            # 第一趟: 收集 helmet/vest 检测框的普通数值，避免持有元数据包装器；
+            # 同时给这些框上色（nvdsosd 原生渲染，与证据帧/预览共享）
             helmet_boxes = []  # [(class_id, conf, cx, cy)]
             vest_boxes = []    # [(class_id, conf, cx, cy)]
             for o in frame_meta.object_items:  # 一次性迭代器
                 if o.unique_component_id == HELMET_UID:
+                    o.rect_params.border_color = (
+                        GREEN if o.class_id == HELMET_CLASS_ID else RED
+                    )
                     helmet_boxes.append(self._box_vals(o))
                 elif o.unique_component_id == VEST_UID:
+                    o.rect_params.border_color = (
+                        GREEN if o.class_id == VEST_CLASS_ID else RED
+                    )
                     vest_boxes.append(self._box_vals(o))
 
-            # 第二趟: 每个 person → ObjectMeta（违规进 attributes）
+            # 第二趟: 每个 person → ObjectMeta（违规进 attributes）+ 状态上色
             objects: list[ObjectMeta] = []
             for obj in frame_meta.object_items:
                 if obj.unique_component_id != PERSON_UID:
@@ -96,6 +118,19 @@ class SafetyProbe(BatchMetadataOperator):
                     attrs.append(AttributeMeta("no_helmet", h_conf))
                 if v == "no_vest":
                     attrs.append(AttributeMeta("no_vest", v_conf))
+
+                # 任一违规=红；双达标=绿；有维度未知=蓝
+                violation = h == "no_helmet" or v == "no_vest"
+                obj.rect_params.border_width = 2
+                if violation:
+                    obj.rect_params.border_color = RED
+                    self._set_osd_label(
+                        obj, " ".join(a.name for a in attrs)
+                    )
+                elif h == "helmet" and v == "vest":
+                    obj.rect_params.border_color = GREEN
+                else:
+                    obj.rect_params.border_color = BLUE
 
                 objects.append(ObjectMeta(
                     class_name="person",
@@ -133,6 +168,18 @@ class SafetyProbe(BatchMetadataOperator):
             o.rect_params.left + o.rect_params.width / 2,
             o.rect_params.top + o.rect_params.height / 2,
         )
+
+    @staticmethod
+    def _set_osd_label(o, text: str):
+        """在 person 框上方叠加违规文本标签（nvdsosd per-object text_params）。"""
+        if not text:
+            return
+        o.text_params.display_text = text.encode("ascii")
+        o.text_params.x_offset = int(o.rect_params.left)
+        o.text_params.y_offset = max(0, int(o.rect_params.top) - 6)
+        o.text_params.font_params.name = osd.FontFamily.Serif
+        o.text_params.font_params.size = 12
+        o.text_params.font_params.color = RED
 
     @staticmethod
     def _matched_conf(obj, boxes, conf_threshold):

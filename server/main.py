@@ -12,11 +12,12 @@
     3. 创建 Webhook 推送器 + 每路摄像头一个 AlertManager（source_id → manager）
     4. 构建 DeepStream pipeline:
            RTSP 源×N → nvstreammux(batch=N) → nvinfer(pgie: person) → nvinfer(helmet)
-                    → nvinfer(vest) → tee → [nvosdbin → nvstreamdemux → RTSP 输出×N | fakesink]
-                                     └── queue → nvvideoconvert → appsink(证据帧缓存, 按 source_id)
-    5. SafetyProbe 挂在 vest，把三模型检测元数据翻译成 ObjectMeta 喂给
-       对应摄像头的 AlertManager（冷却 + 连续帧确认 + 异步 webhook 推送）；
-       触发告警时带上前者缓存的最新原始帧，executor 线程画框 → JPEG → payload。
+                     → nvinfer(vest) → nvdsosd → tee → [nvstreamdemux → RTSP 输出×N | fakesink]
+                                                   └── queue → nvvideoconvert → appsink(证据帧缓存, 按 source_id)
+     5. SafetyProbe 挂在 vest，把三模型检测元数据翻译成 ObjectMeta 喂给
+        对应摄像头的 AlertManager（冷却 + 连续帧确认 + 异步 webhook 推送），
+        同时给对象上色（nvdsosd 原生渲染）；触发告警时带上缓存的最新已渲染帧，
+        executor 线程 JPEG 编码 → payload。
 """
 
 import argparse
@@ -220,12 +221,20 @@ def _serve(config: dict):
     p.add("nvinfer", "helmet", {"config-file-path": helmet_config, "batch-size": num})
     p.add("nvinfer", "vest", {"config-file-path": vest_config, "batch-size": num})
 
-    # 证据帧采集：nvosd 前 tee 分流，缓存每路最新原始帧（分支在 frame_cache 模块建好）
+    # 证据帧采集：nvdsosd 后 tee 分流，缓存每路最新**已渲染**帧（分支在 frame_cache 模块建好）
     frame_cache = FrameCache()
     tee_name = add_evidence_capture(p, frame_cache, gpu_id=0)
 
+    # 单路 nvdsosd 渲染器：始终位于 tee 之前，实时预览与证据帧共享同一渲染源，
+    # 保证证据帧与操作者所见一致（违规红 / 合规绿 / 未知蓝由 SafetyProbe 上色）。
+    p.add("nvdsosd", "osd", {
+        "gpu-id": 0,
+        "process-mode": 1,  # GPU 模式
+        "display-bbox": 1,
+        "display-text": 1,
+    })
+
     if out:
-        p.add("nvosdbin", "osd")
         # 多路输出：batch 帧 → nvstreamdemux 拆成每路独立帧 → 每路一个 RTSP 输出。
         # 每个 nvrtspoutsinkbin 自带一个 RTSP server，必须独占端口：
         #   camera i → port = rtsp_port + i, mount = {mount_prefix}/{camera_id}
@@ -248,11 +257,11 @@ def _serve(config: dict):
             p.link(("demux", f"rtspout{i}"), ("src_%u", ""))
             print(f">>> 相机 {cam['id']} RTSP 输出: "
                   f"rtsp://localhost:{base_port + i}{mount_prefix}/{cam['id']}")
-        p.link("mux", "pgie", "helmet", "vest", tee_name)
-        p.link(tee_name, "osd", "demux")
+        p.link("mux", "pgie", "helmet", "vest", "osd", tee_name)
+        p.link(tee_name, "demux")
     else:
         p.add("fakesink", "sink", {"sync": False, "async": 0})
-        p.link("mux", "pgie", "helmet", "vest", tee_name)
+        p.link("mux", "pgie", "helmet", "vest", "osd", tee_name)
         p.link(tee_name, "sink")
 
     p.attach("vest", Probe("safety-probe",

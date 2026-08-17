@@ -16,8 +16,8 @@ server/
 ├── config.yaml             # 配置文件（修改此处即可，无需改代码）
 ├── metadata.py             # 数据契约：ObjectMeta / AttributeMeta（探针 → 状态机桥）
 ├── pipeline/
-│   ├── probe.py            # SafetyProbe：三模型检测 → 空间关联 → 违规属性 → AlertManager
-│   └── frame_cache.py      # 证据帧采集：tee → appsink 缓存最新原始帧（FrameCache/Retriever）
+│   ├── probe.py            # SafetyProbe：三模型检测 → 空间关联 → 违规属性 + nvdsosd 上色 → AlertManager
+│   └── frame_cache.py      # 证据帧采集：tee → appsink 缓存最新已渲染帧（FrameCache/Retriever）
 ├── alert/
 │   ├── manager.py          # 告警管理（冷却 + 连续帧确认 + 异步 webhook 推送）
 │   └── webhook.py          # Webhook HTTP POST 推送
@@ -44,10 +44,10 @@ python -m server.main --config my_config.yaml
 RTSP 源×N → nvstreammux(batch=N) → nvinfer(pgie: yolo26n 人体检测, uid=1)
                                    → nvinfer(helmet: head/helmet 安全帽检测, uid=3)
                                    → nvinfer(vest: vest/no_vest 反光衣检测, uid=4)
-                                   → tee → [nvosdbin → nvstreamdemux → RTSP 输出×N | fakesink]
-                                      └── queue → nvvideoconvert → appsink（证据帧缓存, 按 source_id）
-                                          ↑
-                               SafetyProbe（挂在 vest 后）
+                                   → nvdsosd → tee → [nvstreamdemux → RTSP 输出×N | fakesink]
+                                                └── queue → nvvideoconvert → appsink（证据帧缓存, 按 source_id）
+                                                    ↑
+                                          SafetyProbe（挂在 vest 后，上色 + 桥接）
 ```
 
 三个模型都是**整帧检测器**（process-mode=1），对同一帧各自独立推理。探针做
@@ -131,18 +131,16 @@ RTSP 源×N → nvstreammux(batch=N) → nvinfer(pgie: yolo26n 人体检测, uid
 ```
 读取帧 → [person 检测] + [helmet 检测] + [vest 检测]（同一帧并行推理）
                                               ↓
-                    探针空间关联 → 逐人 helmet/vest 状态
+                    探针空间关联 → 逐人 helmet/vest 状态 → nvdsosd 上色
                                               ↓
                             有违规（no_helmet 或 no_vest）？
-                                              ↓ 是
+                                              ↓ 是（进入 ARMING）
                                      连续帧计数器 +1
                                               ↓
                                  达到 min_detection_count？
                                               ↓ 是
-                                 冷却期已过？
-                                              ↓ 是
-                                 🚨 触发告警
-                                 ├── 从 FrameCache 取该路最新原始帧（executor 线程画人物框 + 违规标签）
+                                 🚨 触发告警（进入 COOLDOWN）
+                                 ├── 从 FrameCache 取该路最新已渲染帧（executor 线程 JPEG 编码）
                                  ├── 构建 payload（bbox + 违规属性 + frame_base64）
                                  └── Webhook POST（带 JPEG 证据帧）
 ```
@@ -169,18 +167,21 @@ RTSP 源×N → nvstreammux(batch=N) → nvinfer(pgie: yolo26n 人体检测, uid
 }
 ```
 
-- `frame_base64` 为告警时的 **JPEG 证据帧**（BGR → RGB 后由 nvvideoconvert 采集，
-  在 executor 线程画触发告警的人物框 + 违规标签后 `simplejpeg` 编码）。
+- `frame_base64` 为告警时的 **JPEG 证据帧**（nvdsosd 已原生渲染检测框 + 违规标签，
+  由 nvvideoconvert 采集后 executor 线程 `simplejpeg` 编码）。
   无证据帧时仍为 `null`（缓存尚未就绪，告警不丢）。
 
 ## 关键设计
 
-- **复用 `AlertManager`**：冷却 / 连续帧确认 / 异步 webhook 决策逻辑保持不变，
-  仅扩展为允许 `snapshot=None` 时仍推送（`frame_base64=null`），避免无证据帧时丢告警。
-- **探针不阻塞流线程**：探针只做轻量决策，JPEG / base64 / HTTP 由
+- **复用 `AlertManager`**：冷却 / 连续帧确认 / 异步 webhook 决策逻辑重构为显式状态机
+  （`IDLE`/`ARMING`/`COOLDOWN`），仅扩展为允许 `snapshot=None` 时仍推送
+  （`frame_base64=null`），避免无证据帧时丢告警。
+- **探针不阻塞流线程**：探针只做轻量决策 + nvdsosd 上色，JPEG / base64 / HTTP 由
   executor 线程池 + daemon 线程 fire-and-forget。
 - **每路摄像头独立状态机**：`dict[source_id → AlertManager]`，`source_id`
   即 `nvstreammux` 的 pad 序号。
+- **证据帧 = 实时预览帧**：单路 nvdsosd 位于 tee 之前，实时预览与证据帧共享同一
+  渲染源，保证证据帧与操作者所见一致（违规红 / 合规绿 / 未知蓝）。
 
 ## 稳定性说明
 
@@ -193,6 +194,6 @@ RTSP 源×N → nvstreammux(batch=N) → nvinfer(pgie: yolo26n 人体检测, uid
 - **动态 batch 上限 12**：8GB GPU 下三个模型（yolo26n + 2×25M 参检测器）同时以
   batch≤12 构建引擎；如需更多路需重出更大 maxShapes 引擎并评估显存，或降低分辨率。
 - **证据帧有约 1 帧滞后**：告警快照取的是缓存中的最新帧（探针在 vest、appsink
-  在下游，存在流水线时序差），作为违规瞬间的证据可接受；如需严格帧同步可改为在
-  appsink 侧用 `buffer.batch_meta` 直接判定。
-- **RTSP 预览不带违规着色框**：探针专注告警桥接，未给对象上色（demo 才有）。
+  在下游，存在流水线时序差）。由于每帧都已由 nvdsosd 原生渲染（框与像素自洽），
+  滞后帧仍是合法证据；如需严格帧同步可改为按 frame_number/pts 关联。
+- 违规着色由探针（SafetyProbe）在 nvdsosd 上游上色，实时预览与证据帧同步生效。
