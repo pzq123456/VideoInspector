@@ -44,17 +44,24 @@
 - **衰减**：无违规帧时 hits 每帧 `-1`（不立即清零），容忍推理偶发丢帧。
 - **单调时钟**：冷却用 `time.monotonic()`，不受系统 NTP 校时跳变影响。
 - 目标匹配是**两级**的：`ObjectMeta.class_name` 直接命中，或任意
-  `AttributeMeta.name` 命中（两阶段检测：`person` 携带 `no_helmet`/`no_vest` 属性）。
+  `AttributeMeta.name` 命中（两阶段检测：`person` 携带 `no_helmet`/`no_harness`/`no_vest` 属性）。
+- **以检测到人为前提**：违规实体本身已是「person + attributes」结构，且探针已在源头按
+  `person_conf_threshold` 过滤掉低置信度 person，因此状态机只会在确实存在人的前提下累计
+  （帧内无有效 person 时根本不会有违规实体进入 `handle`）。
 
 ## 2. 关键参数（来自 config.yaml 的 `alert` 节）
 
 | 字段 | 默认值 | 作用 |
 |------|--------|------|
 | `alert_type` | `"ppe"` | 告警类型（场景级），随 payload 原样输出；与 `target_classes` 一起换（见 4.1） |
-| `target_classes` | `['no_helmet','no_vest']` | 哪些类别/属性触发告警；`null` 表示全部命中 |
+| `target_classes` | `['no_helmet','no_harness','no_vest']` | 哪些类别/属性触发告警；`null` 表示全部命中 |
 | `min_detection_count` | `3` | 连续命中帧数阈值（防单帧误报） |
 | `cooldown_seconds` | `30` | 同一摄像头两次告警最小间隔（秒） |
 | `save_frame_overlay` | `false` | 是否在证据帧上叠摄像头/时间水印 |
+| `person_conf_threshold` | `0.4` | person 检测置信度门槛，低于此的 person 被探针整体跳过（不判定、不渲染、不告警）；是「一切报警必须基于检测到人」的强制前提，用于压误报 |
+| `helmet_conf_threshold` | `0.5` | 头盔框空间关联 person 的最低置信度（须 ≥ INI 的 `pre-cluster-threshold=0.25`） |
+| `harness_conf_threshold` | `0.5` | 安全带二级分类器门槛，启动时由 `server/main.py` 重写到 sgie INI 的 `classifier-threshold` |
+| `vest_conf_threshold` | `0.5` | 反光衣二级分类器门槛，启动时由 `server/main.py` 重写到 sgie INI 的 `classifier-threshold` |
 | `webhook.url` | `null` | 推送地址；为 `null` 时不推送 |
 | `webhook.timeout` | `10` | 单次 HTTP 请求超时（秒） |
 | `webhook.retries` | `2` | 失败重试次数（总尝试 = retries + 1） |
@@ -98,7 +105,8 @@ HTTP `POST`，`Content-Type: application/json; charset=utf-8`，
       "bbox": [840, 210, 1020, 760],
       "attributes": [
         { "class": "no_helmet", "confidence": 0.91, "bbox": null },
-        { "class": "no_vest",   "confidence": 0.88, "bbox": null }
+        { "class": "no_harness", "confidence": 0.5, "bbox": null },
+        { "class": "no_vest",    "confidence": 0.5, "bbox": null }
       ]
     }
   ],
@@ -117,7 +125,7 @@ HTTP `POST`，`Content-Type: application/json; charset=utf-8`，
 | `objects[].confidence` | float | 主实体置信度（保留 3 位小数） |
 | `objects[].bbox` | array[4] | 全帧坐标 `[x1, y1, x2, y2]` |
 | `objects[].attributes` | array\|省略 | 附属违规属性；无属性时整段省略 |
-| `objects[].attributes[].class` | string | 属性名（`no_helmet` / `no_vest`） |
+| `objects[].attributes[].class` | string | 属性名（`no_helmet` / `no_harness` / `no_vest`） |
 | `objects[].attributes[].confidence` | float | 属性置信度（保留 3 位小数） |
 | `objects[].attributes[].bbox` | array\|null | 当前为纯分类属性，恒为 `null` |
 | `frame_base64` | string\|null | JPEG 证据帧 base64；无证据帧时为 `null` |
@@ -139,7 +147,7 @@ HTTP `POST`，`Content-Type: application/json; charset=utf-8`，
 | `ppe` | 个人防护装备：安全帽 / 反光衣（新接口，`objects` + `attributes`） | 新 URL |
 
 取值用 snake_case，与现有字段风格一致。具体违反哪条由
-`objects[].attributes[].class` 表达（`no_helmet` / `no_vest`），两层刚好是
+`objects[].attributes[].class` 表达（`no_helmet` / `no_harness` / `no_vest`），两层刚好是
 **场景级（这起告警是啥）+ 违规级（具体违反哪条）**。后续加手套/口罩仍归在
 `ppe` 下，`alert_type` 不新增取值。
 

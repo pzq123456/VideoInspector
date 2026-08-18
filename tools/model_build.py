@@ -25,6 +25,12 @@ tools/model_build.py — 单脚本自动构建 DeepStream 模型产物。
   python tools/model_build.py --name person --pt models/person/yolo26n.pt            # uid 默认 1
   python tools/model_build.py --name helmet --pt models/helmet/best.pt --uid 3
   python tools/model_build.py --name helmet --pt models/helmet/best.pt --skip-engine # 只刷 labels/INI
+   python tools/model_build.py --name vest_cls --pt <classify best.pt> --uid 6 --max-batch 32  # classify
+
+classify 分支（二级分类器, 2 类 yes/no）:
+  - ONNX 不烧入 NMS（末尾已带 Softmax, 输出即概率）, labels.txt 全量不裁剪
+  - 动态 batch 默认 32（二级推理 batch = 每帧对象数）
+  - 生成 configs/sgie_config_<name>.txt（二级分类器配置, process-mode=2 作用于 pgie 的 person 结果）
 """
 
 import argparse
@@ -100,7 +106,8 @@ def main():
     ap = argparse.ArgumentParser(description="DeepStream 模型一键构建 (pt→onnx→engine→labels→INI)")
     ap.add_argument("--name", required=True, help="模型逻辑名, 产物写入 models/<name>/ 与 configs/pgie_config_<name>.txt")
     ap.add_argument("--pt", required=True, help="ultralytics best.pt 路径")
-    ap.add_argument("--max-batch", type=int, default=12, help="引擎动态 batch 上限（>= 最大路数）, 默认 12")
+    ap.add_argument("--max-batch", type=int, default=None,
+                    help="引擎动态 batch 上限（>= 最大路数）, 默认: detector 12 / classify 32")
     ap.add_argument("--uid", type=int, default=1, help="gie-unique-id, 默认 1; 多检测器管线需各配不同 uid")
     ap.add_argument("--skip-engine", action="store_true",
                     help="跳过 ONNX 导出与 trtexec, 只刷新 labels.txt + INI（引擎已存在时用）")
@@ -120,15 +127,22 @@ def main():
     names = list(model.names.values())
     n_classes = len(names)
     h, w = model_imgsz(model)
-    # 类别裁剪: >10 类基础模型只留 class 0 (person), 否则全量
-    num_classes = 1 if n_classes > BASE_CLASS_THRESHOLD else n_classes
-    print(f"\n### 模型 {args.name}: {n_classes} 类 -> 输出 {num_classes} 类 "
-          f"(imgsz={h}x{w}, max-batch={args.max_batch}, uid={args.uid})")
+    is_classify = getattr(model, "task", None) == "classify"
+    max_batch = args.max_batch or (32 if is_classify else 12)
+    # 类别裁剪按任务分派: classify 全量; detector >10 类基础模型只留 class 0 (person)
+    num_classes = n_classes if is_classify else (1 if n_classes > BASE_CLASS_THRESHOLD else n_classes)
+    task_tag = " (task=classify)" if is_classify else ""
+    print(f"\n### 模型 {args.name}{task_tag}: {n_classes} 类 -> 输出 {num_classes} 类 "
+          f"(imgsz={h}x{w}, max-batch={max_batch}, uid={args.uid})")
 
     if not args.skip_engine:
-        # --- 1) pt -> onnx (ultralytics NMS 烧入, 动态 batch) ---
-        exported = Path(model.export(format="onnx", nms=True, dynamic=True,
-                                     opset=OP_SET, imgsz=(h, w)))
+        # --- 1) pt -> onnx (动态 batch), 按任务分派 ---
+        if is_classify:
+            # classify: 不烧入 NMS/opset, 仅 dynamic; ONNX 末尾已带 Softmax（概率）
+            exported = Path(model.export(format="onnx", dynamic=True, imgsz=(h, w)))
+        else:
+            exported = Path(model.export(format="onnx", nms=True, dynamic=True,
+                                         opset=OP_SET, imgsz=(h, w)))
         shutil.copyfile(exported, out_dir / ONNX)
         # ultralytics 把 onnx 写到 .pt 同目录（源文件 stem）。若与规范名不同，
         # 清掉旁路产物，保持 models/<name>/ 只留 best.onnx。
@@ -142,26 +156,31 @@ def main():
             f"--onnx={out_dir / ONNX}",
             "--fp16",
             f"--minShapes={INPUT_NAME}:1x3x{h}x{w}",
-            f"--optShapes={INPUT_NAME}:{args.max_batch}x3x{h}x{w}",
-            f"--maxShapes={INPUT_NAME}:{args.max_batch}x3x{h}x{w}",
+            f"--optShapes={INPUT_NAME}:{max_batch}x3x{h}x{w}",
+            f"--maxShapes={INPUT_NAME}:{max_batch}x3x{h}x{w}",
             f"--memPoolSize=workspace:{WORKSPACE_MB}M",
             f"--saveEngine={out_dir / ENGINE}",
-        ], f"构建 TensorRT 引擎 (动态 batch 1~{args.max_batch})")
+        ], f"构建 TensorRT 引擎 (动态 batch 1~{max_batch})")
 
-    # --- 3) labels.txt: 只写输出类别 ---
-    labels = names[:num_classes]
+    # --- 3) labels.txt: classify 全量, detector 只写输出类别 ---
+    labels = names if is_classify else names[:num_classes]
     (out_dir / LABELS).write_text("\n".join(labels) + "\n", encoding="utf-8")
     print(f"\n### labels.txt 已写入 {out_dir / LABELS}: {labels}")
 
-    # --- 4) 渲染 INI 配置 ---
-    tpl = (TEMPLATES / "pgie_config.ini.tpl").read_text(encoding="utf-8")
+    # --- 4) 渲染 INI 配置（按任务分派: classify=二级分类器 sgie / detector=pgie） ---
+    if is_classify:
+        tpl_path = TEMPLATES / "sgie_config.ini.tpl"
+        ini_path = CONFIGS / f"sgie_config_{args.name}.txt"
+    else:
+        tpl_path = TEMPLATES / "pgie_config.ini.tpl"
+        ini_path = CONFIGS / f"pgie_config_{args.name}.txt"
+    tpl = tpl_path.read_text(encoding="utf-8")
     ini = (tpl.replace("{{name}}", args.name)
               .replace("{{num_classes}}", str(num_classes))
               .replace("{{uid}}", str(args.uid)))
-    ini_path = CONFIGS / f"pgie_config_{args.name}.txt"
     ini_path.write_text(ini, encoding="utf-8")
 
-    print(f"\n### 完成: {args.name}")
+    print(f"\n### 完成: {args.name}{task_tag}")
     for rel in (out_dir / ONNX, out_dir / ENGINE, out_dir / LABELS, ini_path):
         if rel.exists():
             size_mb = rel.stat().st_size / 1e6

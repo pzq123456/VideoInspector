@@ -5,18 +5,22 @@
 # =============================================================================
 
 # -----------------------------------------------------------------------------
-# 模型参数（三阶段 DeepStream 推理）
-#   pgie   → 人体检测（yolo26n, person 类, uid=1）
-#   helmet → 安全帽整帧检测（head/helmet, uid=3）
-#   vest   → 反光衣整帧检测（vest/no_vest, uid=4）
+# 模型参数（两阶段 DeepStream 推理）
+#   第一阶段·整帧检测（primary GIE）:
+#     pgie   → 人体检测（yolo26n, person 类, uid=1）
+#     helmet → 安全帽整帧检测（head/helmet, uid=3）
+#   第二阶段·二级分类器（secondary GIE, process-mode=2, 裁剪 person 整框）:
+#     harness_cls → 安全带 2 类分类器（uid=5）
+#     vest_cls    → 反光衣 2 类分类器（uid=6）
 # 配置为 INI 文本（路径可相对项目根目录解析），INI 内部引用的模型路径同样
 # 相对根目录，启动时由 server/main.py 统一锚定为绝对路径（开发容器 /
 # 生产镜像 /app 通用）。引擎/parser 复用根目录 models/ 已有产物。
 # -----------------------------------------------------------------------------
 model:
-  pgie_config: "configs/pgie_config_person.txt"    # 人体检测
-  helmet_config: "configs/pgie_config_helmet.txt"  # 安全帽
-  vest_config: "configs/pgie_config_vest.txt"      # 反光衣
+  pgie_config: "configs/pgie_config_person.txt"       # 人体检测（整帧, uid=1）
+  helmet_config: "configs/pgie_config_helmet.txt"     # 安全帽（整帧, uid=3）
+  harness_cls_config: "configs/sgie_config_harness_cls.txt"  # 安全带分类器（二级, uid=5）
+  vest_cls_config: "configs/sgie_config_vest_cls.txt"        # 反光衣分类器（二级, uid=6）
 
 # -----------------------------------------------------------------------------
 # 摄像头列表
@@ -60,12 +64,16 @@ cameras:
 # -----------------------------------------------------------------------------
 alert:
   alert_type: "ppe"          # 与平台约定的告警类型（场景级，随 payload 原样输出）；和 target_classes 一起换
-  target_classes: ['no_helmet', 'no_vest']  # 触发告警的违规属性名（匹配 ObjectMeta.attributes）
+  target_classes: ['no_helmet', 'no_harness', 'no_vest']  # 触发告警的违规属性名（匹配 ObjectMeta.attributes）
   cooldown_seconds: 10           # 同一摄像头两次告警的最小间隔（秒）
   min_detection_count: 3         # 连续检测到违规的帧数阈值（防止单帧误报）
   save_frame_overlay: false      # 是否在证据帧上叠加摄像头名称/时间水印（证据帧已启用，告警带图）
-  helmet_conf_threshold: 0.5     # 头盔框匹配 person 的最低置信度
-  vest_conf_threshold: 0.8       # 反光衣框匹配 person 的最低置信度
+  helmet_conf_threshold: 0.5     # helmet 整帧框匹配 person 的最低置信度（空间关联用；
+                                  # 反光衣/安全带已改为二级分类器，其阈值由 sgie INI 的
+                                  # classifier-threshold 控制，probe 不再需要阈值参数）
+  person_conf_threshold: 0.6     # person 检测置信度门槛，低于此视为噪声（不判定、不渲染、不告警）
+  harness_conf_threshold: 0.6    # 安全带分类器门槛（重写到 sgie INI 的 classifier-threshold）
+  vest_conf_threshold: 0.6       # 反光衣分类器门槛（重写到 sgie INI 的 classifier-threshold）
 
   webhook:
     # url: "http://192.168.1.24:6034/protal/smoking-alarm/webhook"

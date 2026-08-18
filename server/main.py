@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-安全帽 / 反光衣检测服务端入口（DeepStream 三模型整帧检测）
+安全帽 / 反光衣检测服务端入口（DeepStream 两阶段：整帧检测 + 二级分类器）
 
 启动方式:
     python -m server.main                  # 使用默认配置 server/config.yaml
@@ -10,11 +10,14 @@
     1. 加载并校验 YAML 配置（摄像头仅支持 RTSP，可多路；N 路需动态 batch 引擎）
     2. 初始化日志
     3. 创建 Webhook 推送器 + 每路摄像头一个 AlertManager（source_id → manager）
-    4. 构建 DeepStream pipeline:
-           RTSP 源×N → nvstreammux(batch=N) → nvinfer(pgie: person) → nvinfer(helmet)
-                     → nvinfer(vest) → nvstreamdemux → 每路:
+    4. 构建 DeepStream pipeline（两阶段架构）:
+           RTSP 源×N → nvstreammux(batch=N) → nvinfer(pgie: person, 整帧, uid=1)
+                     → nvinfer(helmet, 整帧, uid=3)
+                     → nvinfer(harness_cls, 二级分类器, process-mode=2, uid=5, 裁剪 person 整框)
+                     → nvinfer(vest_cls,   二级分类器, process-mode=2, uid=6, 裁剪 person 整框)
+                     → nvstreamdemux → 每路:
                            nvdsosd → tee → [ shmsink(→ 单端口 RTSP server) | appsink(证据帧缓存) ]
-     5. SafetyProbe 挂在 vest，把三模型检测元数据翻译成 ObjectMeta 喂给
+     5. SafetyProbe 挂在 vest_cls，把两阶段检测元数据翻译成 ObjectMeta 喂给
         对应摄像头的 AlertManager（冷却 + 连续帧确认 + 异步 webhook 推送），
         同时给对象上色（nvdsosd 原生渲染，demux 后每路独立，杜绝跨流污染）；
         触发告警时带上该路缓存的最新已渲染帧，executor 线程 JPEG 编码 → payload。
@@ -69,7 +72,7 @@ def _validate_config(config: dict, path: Path):
     errors = []
 
     model = config.get("model") or {}
-    for key in ("pgie_config", "helmet_config", "vest_config"):
+    for key in ("pgie_config", "helmet_config", "harness_cls_config", "vest_cls_config"):
         if not model.get(key):
             errors.append(f"model.{key} 为必填项")
 
@@ -86,7 +89,7 @@ def _validate_config(config: dict, path: Path):
     if "alert" not in config:
         errors.append("缺少 'alert' 节")
     else:
-        for key in ("helmet_conf_threshold", "vest_conf_threshold"):
+        for key in ("person_conf_threshold", "helmet_conf_threshold", "harness_conf_threshold", "vest_conf_threshold"):
             val = config["alert"].get(key)
             if val is not None and not (isinstance(val, (int, float)) and 0.0 <= val <= 1.0):
                 errors.append(f"alert.{key} 必须是 0~1 的置信度阈值，当前: {val!r}")
@@ -110,7 +113,7 @@ _REQUIRED_PATH_KEYS = ("model-engine-file", "custom-lib-path", "labelfile-path")
 _patched_dir: Path | None = None
 
 
-def _anchor_ini_config(src: Path) -> str:
+def _anchor_ini_config(src: Path, classifier_threshold: float | None = None) -> str:
     """把 INI 内相对项目根的模型路径补全为绝对路径，返回 patched 文件路径。
 
     fail fast: 锚定后校验运行期必需的引擎/parser/标签文件存在，
@@ -129,6 +132,8 @@ def _anchor_ini_config(src: Path) -> str:
                 val = str(_PROJECT_ROOT / val)
                 raw = f"{m.group(1)}={val}"
             resolved[m.group(1)] = val
+        elif m and classifier_threshold is not None and m.group(1) == "classifier-threshold":
+            raw = f"classifier-threshold={classifier_threshold}"
         out_lines.append(raw)
 
     missing = [
@@ -184,10 +189,23 @@ def _serve(config: dict):
     )
     logger.info("startup safety_detection_server")
 
+    # PPE 告警置信度门槛（harness/vest 用于重写 sgie INI 的 classifier-threshold）
+    alert_cfg = config.get("alert", {})
+    person_conf_threshold = float(alert_cfg.get("person_conf_threshold", 0.4))
+    harness_conf_threshold = float(alert_cfg.get("harness_conf_threshold", 0.5))
+    vest_conf_threshold = float(alert_cfg.get("vest_conf_threshold", 0.5))
+
     model = config["model"]
     pgie_config = _anchor_ini_config(Path(_resolve(_PROJECT_ROOT, model["pgie_config"])))
     helmet_config = _anchor_ini_config(Path(_resolve(_PROJECT_ROOT, model["helmet_config"])))
-    vest_config = _anchor_ini_config(Path(_resolve(_PROJECT_ROOT, model["vest_config"])))
+    harness_cls_config = _anchor_ini_config(
+        Path(_resolve(_PROJECT_ROOT, model["harness_cls_config"])),
+        classifier_threshold=harness_conf_threshold,
+    )
+    vest_cls_config = _anchor_ini_config(
+        Path(_resolve(_PROJECT_ROOT, model["vest_cls_config"])),
+        classifier_threshold=vest_conf_threshold,
+    )
 
     # Webhook 推送器（全局共享一个）
     webhook_cfg = config.get("alert", {}).get("webhook", {})
@@ -203,11 +221,9 @@ def _serve(config: dict):
         logger.warning("未配置 Webhook URL，告警不会推送")
 
     # 每路摄像头一个 AlertManager（source_id 即 nvstreammux 的 pad 序）
-    alert_cfg = config.get("alert", {})
-    target_classes = alert_cfg.get("target_classes", ["no_helmet", "no_vest"])
+    target_classes = alert_cfg.get("target_classes", ["no_helmet", "no_harness", "no_vest"])
     # 空间关联置信度门槛（须 >= INI 的 pre-cluster-threshold=0.25）
     helmet_conf_threshold = float(alert_cfg.get("helmet_conf_threshold", 0.5))
-    vest_conf_threshold = float(alert_cfg.get("vest_conf_threshold", 0.5))
     cameras = [c for c in config.get("cameras") or [] if c.get("enabled", True)]
     alert_managers = {}
     for i, cam in enumerate(cameras):
@@ -255,12 +271,14 @@ def _serve(config: dict):
         })
         p.link((f"src{i}", "mux"), ("", "sink_%u"))  # CRITICAL: 必须用 "sink_%u"
 
-    # 三个整帧检测器，顺序 pgie → helmet → vest（无次级 GIE，不会卡死）
+    # 第一阶段整帧检测 + 第二阶段二级分类器（裁剪 person 整框）:
+    # 顺序 pgie → helmet → harness_cls → vest_cls
     p.add("nvinfer", "pgie", {"config-file-path": pgie_config, "batch-size": num})
     p.add("nvinfer", "helmet", {"config-file-path": helmet_config, "batch-size": num})
-    p.add("nvinfer", "vest", {"config-file-path": vest_config, "batch-size": num})
+    p.add("nvinfer", "harness_cls", {"config-file-path": harness_cls_config, "batch-size": num})
+    p.add("nvinfer", "vest_cls", {"config-file-path": vest_cls_config, "batch-size": num})
 
-    # vest 后立即拆流：之后每路独立渲染/采集/输出，彻底隔离跨流污染
+    # vest_cls 后立即拆流：之后每路独立渲染/采集/输出，彻底隔离跨流污染
     p.add("nvstreamdemux", "demux")
 
     # RTSP 输出参数（单端口 + 每路不同 mount path）
@@ -313,14 +331,14 @@ def _serve(config: dict):
                    f"enc{i}", f"parse{i}", f"shm{i}")
             rtsp_mounts[f"{mount_prefix}/{cam['id']}"] = shm_socket
 
-    p.link("mux", "pgie", "helmet", "vest", "demux")
+    p.link("mux", "pgie", "helmet", "harness_cls", "vest_cls", "demux")
 
-    p.attach("vest", Probe("safety-probe",
-                           SafetyProbe(alert_managers, executor=executor,
-                                       frame_cache=frame_cache,
-                                       helmet_conf_threshold=helmet_conf_threshold,
-                                       vest_conf_threshold=vest_conf_threshold)))
-    p.attach("vest", "measure_fps_probe", name="fps-probe")
+    p.attach("vest_cls", Probe("safety-probe",
+                                SafetyProbe(alert_managers, executor=executor,
+                                            frame_cache=frame_cache,
+                                            helmet_conf_threshold=helmet_conf_threshold,
+                                            person_conf_threshold=person_conf_threshold)))
+    p.attach("vest_cls", "measure_fps_probe", name="fps-probe")
 
     # 单端口 RTSP 输出服务：所有摄像头共用 rtsp_port，路径区分 /cam/{camera_id}
     rtsp_server = None

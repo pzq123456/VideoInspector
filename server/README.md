@@ -1,8 +1,9 @@
 # 安全帽 / 反光衣检测服务端（DeepStream）
 
-基于 DeepStream 的三模型整帧检测实时后台服务：对每路 RTSP 摄像头同时跑
-**人体 / 安全帽 / 反光衣** 三个检测模型，逐人判定「戴帽 + 穿反光衣」状态，
-检测到违规（`no_helmet` / `no_vest`）后通过 Webhook 推送告警（含 bbox 与
+基于 DeepStream 的**两阶段**检测实时后台服务：对每路 RTSP 摄像头先整帧跑
+**人体 / 安全帽** 检测模型，再对每个 person 整框裁剪喂给 **安全带 / 反光衣**
+二级分类器，逐人判定「戴帽 + 穿反光衣 + 系安全带」状态，检测到违规
+（`no_helmet` / `no_harness` / `no_vest`）后通过 Webhook 推送告警（含 bbox 与
 违规属性）。
 
 推理全部由 DeepStream（`nvinfer` + `nvstreammux` batch + 探针空间关联）完成，
@@ -16,7 +17,7 @@ server/
 ├── config.yaml             # 配置文件（修改此处即可，无需改代码）
 ├── metadata.py             # 数据契约：ObjectMeta / AttributeMeta（探针 → 状态机桥）
 ├── pipeline/
-│   ├── probe.py            # SafetyProbe：三模型检测 → 空间关联 → 违规属性 + nvdsosd 上色 → AlertManager
+│   ├── probe.py            # SafetyProbe：整帧检测 + 二级分类器 → 违规属性 + nvdsosd 上色 → AlertManager
 │   ├── frame_cache.py      # 证据帧采集：每路 tee → appsink 缓存最新已渲染帧（FrameCache/Retriever）
 │   └── rtsp_server.py      # 单端口 RTSP 输出（GstRtspServer，/cam/{id} 多挂载点）
 ├── alert/
@@ -42,20 +43,26 @@ python -m server.main --config my_config.yaml
 ## 推理流水线
 
 ```
-RTSP 源×N → nvstreammux(batch=N) → nvinfer(pgie: yolo26n 人体检测, uid=1)
-                                   → nvinfer(helmet: head/helmet 安全帽检测, uid=3)
-                                   → nvinfer(vest: vest/no_vest 反光衣检测, uid=4)
+RTSP 源×N → nvstreammux(batch=N) → nvinfer(pgie: yolo26n 人体检测, uid=1, 整帧)
+                                   → nvinfer(helmet: head/helmet 安全帽检测, uid=3, 整帧)
+                                   → nvinfer(harness_cls: harness/no_harness 安全带分类器, uid=5, 二级)
+                                   → nvinfer(vest_cls: no_vest/vest 反光衣分类器, uid=6, 二级)
                                    → nvstreamdemux → 每路:
                                         nvdsosd → tee → [ shmsink(→ 单端口 RTSP server) | appsink(证据帧缓存) ]
                                             ↑
-                                  SafetyProbe（挂在 vest 后，上色 + 桥接）
+                                  SafetyProbe（挂在 vest_cls 后，上色 + 桥接）
 ```
 
-三个模型都是**整帧检测器**（process-mode=1），对同一帧各自独立推理。探针做
-**空间关联**（helmet/vest 检测框**中心点**落在 person 框内 → 归属该人），
-把违规翻译成 `AttributeMeta('no_helmet')` / `AttributeMeta('no_vest')`
-附加到对应 person 的 `ObjectMeta`，按 `source_id` 喂给对应摄像头的
-`AlertManager`。模型 / 引擎 / 自定义 parser 全部复用根目录 `models/` 产物。
+person / helmet 是**整帧检测器**（process-mode=1），对同一帧各自独立推理；
+harness_cls / vest_cls 是**二级分类器**（process-mode=2，`operate-on-gie-id=1`），
+自动裁剪 pgie 检出的每个 person 整框 → letterbox 到 320×320 → 分类，结果以
+`NvDsClassifierMeta` 挂在对应 person 对象上。
+
+探针做 **helmet 空间关联**（head/helmet 检测框**中心点**落在 person 框内 →
+归属该人），并读取 person 对象上的 harness / vest 分类器结果，把违规翻译成
+`AttributeMeta('no_helmet')` / `AttributeMeta('no_harness')` /
+`AttributeMeta('no_vest')` 附加到对应 person 的 `ObjectMeta`，按 `source_id`
+喂给对应摄像头的 `AlertManager`。模型 / 引擎全部复用根目录 `models/` 产物。
 
 ## 配置文件参考 (config.yaml)
 
@@ -63,9 +70,10 @@ RTSP 源×N → nvstreammux(batch=N) → nvinfer(pgie: yolo26n 人体检测, uid
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| `pgie_config` | string | 人体检测（yolo26n）nvinfer 配置文件路径 |
+| `pgie_config` | string | 人体检测（yolo26n）nvinfer 配置文件路径（整帧） |
 | `helmet_config` | string | 安全帽整帧检测 nvinfer 配置文件路径 |
-| `vest_config` | string | 反光衣整帧检测 nvinfer 配置文件路径 |
+| `harness_cls_config` | string | 安全带二级分类器 nvinfer 配置文件路径 |
+| `vest_cls_config` | string | 反光衣二级分类器 nvinfer 配置文件路径 |
 
 路径相对项目根目录解析；INI 配置内部引用的模型路径同样相对根目录
 （`models/` / `configs/`），启动时由 `server/main.py` 统一锚定为绝对路径，
@@ -89,12 +97,20 @@ RTSP 源×N → nvstreammux(batch=N) → nvinfer(pgie: yolo26n 人体检测, uid
 
 | 字段 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `target_classes` | list | `['no_helmet','no_vest']` | 触发告警的违规属性名（匹配 `ObjectMeta.attributes`） |
+| `target_classes` | list | `['no_helmet','no_harness','no_vest']` | 触发告警的违规属性名（匹配 `ObjectMeta.attributes`） |
 | `cooldown_seconds` | float | `30` | 同一摄像头两次告警的最小间隔（秒） |
 | `min_detection_count` | int | `3` | 连续检测到违规的帧数阈值（防止单帧误报） |
-| `save_frame_overlay` | bool | `false` | 是否在证据帧上叠加摄像头名称/时间水印（暂无证据帧，保留字段） |
-| `helmet_conf_threshold` | float | `0.5` | 头盔框空间关联 person 的最低置信度（须 ≥ INI 的 `pre-cluster-threshold=0.25`） |
-| `vest_conf_threshold` | float | `0.5` | 反光衣框空间关联 person 的最低置信度（须 ≥ INI 的 `pre-cluster-threshold=0.25`） |
+| `save_frame_overlay` | bool | `false` | 是否在证据帧上叠加摄像头名称/时间水印（证据帧已启用，告警带图） |
+| `helmet_conf_threshold` | float | `0.5` | 头盔框空间关联 person 的最低置信度（须 ≥ INI 的 `pre-cluster-threshold=0.25`）；另三个 PPE 门槛见相邻行 |
+| `person_conf_threshold` | float | `0.4` | person 检测置信度门槛，低于此的 person 被探针整体跳过（不判定、不渲染、不告警），是「一切报警必须基于检测到人」的强制前提，用于压误报 |
+| `harness_conf_threshold` | float | `0.5` | 安全带二级分类器门槛，启动时由 `server/main.py` 重写到 sgie INI 的 `classifier-threshold` |
+| `vest_conf_threshold` | float | `0.5` | 反光衣二级分类器门槛，启动时由 `server/main.py` 重写到 sgie INI 的 `classifier-threshold` |
+
+> harness / vest 是二级分类器，pyservicemaker 拿不到分类置信度（只有 label 名），
+> 其判定阈值现已由本配置 `alert.harness_conf_threshold` / `alert.vest_conf_threshold`
+> 在启动时重写到各自 sgie INI 的 `classifier-threshold`，不再需手改 INI；
+> 低于阈值的模糊裁剪样本会被判为「维度未知」（蓝框）。
+> person / helmet 是整帧检测器，置信度由探针直接获取，在探针内按门槛过滤。
 
 #### alert.webhook — Webhook 推送
 
@@ -131,21 +147,27 @@ RTSP 源×N → nvstreammux(batch=N) → nvinfer(pgie: yolo26n 人体检测, uid
 ## 检测流程
 
 ```
-读取帧 → [person 检测] + [helmet 检测] + [vest 检测]（同一帧并行推理）
-                                              ↓
-                    探针空间关联 → 逐人 helmet/vest 状态 → nvdsosd 上色
-                                              ↓
-                            有违规（no_helmet 或 no_vest）？
-                                              ↓ 是（进入 ARMING）
-                                     连续帧计数器 +1
-                                              ↓
-                                 达到 min_detection_count？
-                                              ↓ 是
-                                 🚨 触发告警（进入 COOLDOWN）
-                                 ├── 从 FrameCache 取该路最新已渲染帧（executor 线程 JPEG 编码）
-                                 ├── 构建 payload（bbox + 违规属性 + frame_base64）
-                                 └── Webhook POST（带 JPEG 证据帧）
+读取帧 → [person 检测] + [helmet 检测]（整帧并行推理）
+                ↓
+    [harness 分类] + [vest 分类]（裁剪 person 整框 → 320×320 二级分类）
+                ↓
+  探针：helmet 空间关联 + 读取分类器结果 → 逐人 helmet/harness/vest 状态 → nvdsosd 上色
+                ↓
+       有违规（no_helmet / no_harness / no_vest）？
+                ↓ 是（进入 ARMING）
+       连续帧计数器 +1
+                ↓
+   达到 min_detection_count？
+                ↓ 是
+   🚨 触发告警（进入 COOLDOWN）
+   ├── 从 FrameCache 取该路最新已渲染帧（executor 线程 JPEG 编码）
+    ├── 构建 payload（bbox + 违规属性 + frame_base64）
+    └── Webhook POST（带 JPEG 证据帧）
 ```
+
+> **强制前提**：报警以**检测到人**为前提——探针只处理 person 置信度
+> `≥ person_conf_threshold` 的实体，帧内无有效 person 时任何 PPE 违规
+> （`no_helmet` / `no_harness` / `no_vest`）都不报警。
 
 ## Webhook Payload 格式
 
@@ -161,7 +183,8 @@ RTSP 源×N → nvstreammux(batch=N) → nvinfer(pgie: yolo26n 人体检测, uid
       "bbox": [840, 210, 1020, 760],
       "attributes": [
         { "class": "no_helmet", "confidence": 0.91, "bbox": null },
-        { "class": "no_vest",   "confidence": 0.88, "bbox": null }
+        { "class": "no_harness", "confidence": 0.5, "bbox": null },
+        { "class": "no_vest",    "confidence": 0.5, "bbox": null }
       ]
     }
   ],
@@ -172,6 +195,9 @@ RTSP 源×N → nvstreammux(batch=N) → nvinfer(pgie: yolo26n 人体检测, uid
 - `frame_base64` 为告警时的 **JPEG 证据帧**（nvdsosd 已原生渲染检测框 + 违规标签，
   由 nvvideoconvert 采集后 executor 线程 `simplejpeg` 编码）。
   无证据帧时仍为 `null`（缓存尚未就绪，告警不丢）。
+- `no_harness` / `no_vest` 属性置信度当前固定为 `0.5`（= sgie `classifier-threshold`）：
+  pyservicemaker 的 `get_n_label()` 只返回 label 名、不含概率，故回退到阈值。若平台
+  需要真实分类置信度，需在 nvinfer 侧扩展（如自定义 classifier parser 输出概率）。
 
 ## 关键设计
 
@@ -200,7 +226,7 @@ RTSP 源×N → nvstreammux(batch=N) → nvinfer(pgie: yolo26n 人体检测, uid
 
 - **动态 batch 上限 12**：8GB GPU 下三个模型（yolo26n + 2×25M 参检测器）同时以
   batch≤12 构建引擎；如需更多路需重出更大 maxShapes 引擎并评估显存，或降低分辨率。
-- **证据帧有约 1 帧滞后**：告警快照取的是缓存中的最新帧（探针在 vest、appsink
+- **证据帧有约 1 帧滞后**：告警快照取的是缓存中的最新帧（探针在 vest_cls、appsink
   在下游，存在流水线时序差）。由于每帧都已由 nvdsosd 原生渲染（框与像素自洽），
   滞后帧仍是合法证据；如需严格帧同步可改为按 frame_number/pts 关联。
 - 违规着色由探针（SafetyProbe）在 nvdsosd 上游上色，实时预览与证据帧同步生效。
