@@ -23,6 +23,7 @@
 """
 
 import argparse
+import glob
 import os
 import re
 import sys
@@ -145,10 +146,35 @@ def _anchor_ini_config(src: Path) -> str:
     return str(out)
 
 
+def _clean_stale_shm_sockets(socket_path: str, logger) -> None:
+    """删除上次进程残留的 shm 控制 socket（base 与 .N 变体）。
+
+    GStreamer shmsink 在 bind() 遇到 EADDRINUSE（上次进程异常退出后残留的
+    socket 文件）时会**静默退避**成 socket-path.0/.1/...（见 gst-plugins-bad
+    sys/shm/shmpipe.c sp_writer_create: `snprintf(..., "%s.%d", path, i)`），
+    而 RTSP 侧 shmsrc 仍连接原始路径 —— 两端路径错位，预览报 503
+    "Service Unavailable"。每次启动前清掉 base 及所有 .N 变体，
+    保证 shmsink 总是绑定 shmsrc 期望的原始路径。
+    """
+    for p in glob.glob(socket_path) + glob.glob(f"{socket_path}.*"):
+        try:
+            os.unlink(p)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            logger.warning("清理残留 shm socket 失败: {} ({})", p, exc)
+
+
 # ============================================================================
 # 子进程: 构建并运行 DeepStream pipeline
 # ============================================================================
 def _serve(config: dict):
+    # 默认收紧 GStreamer 日志，压掉 pyservicemaker/DeepStream 每次启动刷屏的
+    # "Add Element ... / LINKING: ..." 与输入源 "Opening in BLOCKING MODE"
+    # 等 INFO 噪音；nvinfer 模型加载日志走 g_print 不受影响。
+    # 需要排查管道问题时显式设置 GST_DEBUG=4 即可覆盖。
+    os.environ.setdefault("GST_DEBUG", "0")
+
     log_cfg = config.get("log") or {}
     logger = setup_logger(
         name="safety_server",
@@ -204,6 +230,16 @@ def _serve(config: dict):
     num = len(cameras)
     out = config.get("output")
 
+    # RTSP 输入传输协议（nvurisrcbin 的 select-rtp-protocol）:
+    #   4=TCP(推荐), 1=UDP, 2=UDP-MCAST, 7=自动(UDP 优先, 失败回退 TCP)。
+    # 摄像头/防火墙不通 UDP 时，默认的 7 会让每路启动都先等 5s UDP 超时才
+    # 回退 TCP，并刷屏 "Could not receive any UDP packets ... Retrying using
+    # a tcp connection" 告警。本项目摄像头实测必须走 TCP，直接锁定 4。
+    rtsp_protocol = int((config.get("source") or {}).get("rtsp_protocol", 4))
+    if rtsp_protocol not in (1, 2, 4, 7):
+        logger.warning("未知 source.rtsp_protocol={}，回退默认 4 (TCP)", rtsp_protocol)
+        rtsp_protocol = 4
+
     p = Pipeline("safety-detector")
     p.add("nvstreammux", "mux", {
         "batch-size": num,
@@ -213,7 +249,10 @@ def _serve(config: dict):
         "live-source": 1,  # 仅支持 RTSP
     })
     for i, cam in enumerate(cameras):
-        p.add("nvurisrcbin", f"src{i}", {"uri": cam["rtsp_url"]})
+        p.add("nvurisrcbin", f"src{i}", {
+            "uri": cam["rtsp_url"],
+            "select-rtp-protocol": rtsp_protocol,
+        })
         p.link((f"src{i}", "mux"), ("", "sink_%u"))  # CRITICAL: 必须用 "sink_%u"
 
     # 三个整帧检测器，顺序 pgie → helmet → vest（无次级 GIE，不会卡死）
@@ -251,6 +290,9 @@ def _serve(config: dict):
 
         if out:
             shm_socket = f"/tmp/vi_cam_{i}"
+            # 关键修复: 清掉上次进程残留的 shm socket，否则 shmsink 会退避成
+            # /tmp/vi_cam_0.N，与 RTSP 侧 shmsrc 的原始路径错位，预览 503。
+            _clean_stale_shm_sockets(shm_socket, logger)
             p.add("nvvideoconvert", f"rtsp-conv{i}", {"gpu-id": 0, "compute-hw": 1})
             p.add("capsfilter", f"rtsp-caps{i}", {
                 "caps": "video/x-raw(memory:NVMM), format=NV12",
@@ -286,7 +328,7 @@ def _serve(config: dict):
         rtsp_server = SinglePortRtspServer(rtsp_port, rtsp_mounts, codec=codec)
         rtsp_server.start()
         for mount in rtsp_mounts:
-            print(f">>> RTSP 输出: rtsp://localhost:{rtsp_port}{mount}")
+            logger.info("RTSP 输出: rtsp://localhost:{}{}", rtsp_port, mount)
 
     logger.info("pipeline started cameras={} batch={}", num, num)
     try:
