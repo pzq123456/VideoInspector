@@ -74,10 +74,37 @@ harness_cls / vest_cls 是**二级分类器**（process-mode=2，`operate-on-gie
 | `helmet_config` | string | 安全帽整帧检测 nvinfer 配置文件路径 |
 | `harness_cls_config` | string | 安全带二级分类器 nvinfer 配置文件路径 |
 | `vest_cls_config` | string | 反光衣二级分类器 nvinfer 配置文件路径 |
+| `person_conf_threshold` | float | person 检测置信度门槛，低于此的 person 被探针整体跳过（不判定、不渲染、不告警），是「一切报警必须基于检测到人」的强制前提，用于压误报 |
 
 路径相对项目根目录解析；INI 配置内部引用的模型路径同样相对根目录
 （`models/` / `configs/`），启动时由 `server/main.py` 统一锚定为绝对路径，
 开发容器与生产镜像（`/app`）通用。
+
+### rules — 告警规则（每条独立状态机）
+
+每条规则独立配置 `cooldown_seconds` / `min_detection_count` / `attribute_threshold`，
+互不竞争（`no_helmet` 触发冷却不会锁住 `no_vest`）。
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `cooldown_seconds` | float | 触发告警后的冷却时长（同一规则同一摄像头，秒） |
+| `min_detection_count` | int | 连续检测到违规的帧数阈值（防止单帧误报） |
+| `attribute_threshold` | float | 违规置信度门限；同时作为 helmet 框空间关联 person 的最低置信度（须 ≥ INI 的 `pre-cluster-threshold=0.25`） |
+
+> harness / vest 是二级分类器，pyservicemaker 拿不到分类置信度（只有 label 名），
+> 其判定阈值 = 对应规则（`no_harness` / `no_vest`）的 `attribute_threshold`，
+> 由启动时重写到各自 sgie INI 的 `classifier-threshold`，不再需手改 INI；
+> 低于阈值的模糊裁剪样本会被判为「维度未知」（蓝框）。
+> `no_helmet` 的 `attribute_threshold` 同时作为 helmet 整帧框匹配 person 的
+> 空间关联门限（person / helmet 是整帧检测器，置信度由探针直接获取）。
+
+### webhook — Webhook 推送
+
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `url` | string | `null` | Webhook 接收地址。为 null 时不推送 |
+| `timeout` | float | `10` | 单次请求超时（秒） |
+| `retries` | int | `2` | 失败后重试次数（不含首次） |
 
 ### cameras — 摄像头列表
 
@@ -85,40 +112,13 @@ harness_cls / vest_cls 是**二级分类器**（process-mode=2，`operate-on-gie
 |------|------|------|
 | `id` | string | 唯一标识，用于告警 payload |
 | `name` | string | 显示名称 |
-| `type` | string | 仅支持 `rtsp` |
 | `rtsp_url` | string | RTSP 流地址 |
 | `enabled` | bool | 是否启用 |
+| `active_rules` | list | 本路跟踪的规则名（引用 `rules` 节），只计算/判定/渲染这些维度 |
 
 > **多路支持**：引擎为动态 batch（1~12），mux/nvinfer 的 `batch-size` 自动取
 > `len(cameras)`。每路摄像头独立 AlertManager + 独立 OSD 渲染（demux 后每路独立，
 > 杜绝跨流污染）+ 独立证据帧缓存。
-
-### alert — 告警参数
-
-| 字段 | 类型 | 默认值 | 说明 |
-|------|------|--------|------|
-| `target_classes` | list | `['no_helmet','no_harness','no_vest']` | 触发告警的违规属性名（匹配 `ObjectMeta.attributes`） |
-| `cooldown_seconds` | float | `30` | 同一摄像头两次告警的最小间隔（秒） |
-| `min_detection_count` | int | `3` | 连续检测到违规的帧数阈值（防止单帧误报） |
-| `save_frame_overlay` | bool | `false` | 是否在证据帧上叠加摄像头名称/时间水印（证据帧已启用，告警带图） |
-| `helmet_conf_threshold` | float | `0.5` | 头盔框空间关联 person 的最低置信度（须 ≥ INI 的 `pre-cluster-threshold=0.25`）；另三个 PPE 门槛见相邻行 |
-| `person_conf_threshold` | float | `0.4` | person 检测置信度门槛，低于此的 person 被探针整体跳过（不判定、不渲染、不告警），是「一切报警必须基于检测到人」的强制前提，用于压误报 |
-| `harness_conf_threshold` | float | `0.5` | 安全带二级分类器门槛，启动时由 `server/main.py` 重写到 sgie INI 的 `classifier-threshold` |
-| `vest_conf_threshold` | float | `0.5` | 反光衣二级分类器门槛，启动时由 `server/main.py` 重写到 sgie INI 的 `classifier-threshold` |
-
-> harness / vest 是二级分类器，pyservicemaker 拿不到分类置信度（只有 label 名），
-> 其判定阈值现已由本配置 `alert.harness_conf_threshold` / `alert.vest_conf_threshold`
-> 在启动时重写到各自 sgie INI 的 `classifier-threshold`，不再需手改 INI；
-> 低于阈值的模糊裁剪样本会被判为「维度未知」（蓝框）。
-> person / helmet 是整帧检测器，置信度由探针直接获取，在探针内按门槛过滤。
-
-#### alert.webhook — Webhook 推送
-
-| 字段 | 类型 | 默认值 | 说明 |
-|------|------|--------|------|
-| `url` | string | `null` | Webhook 接收地址。为 null 时不推送 |
-| `timeout` | float | `10` | 单次请求超时（秒） |
-| `retries` | int | `2` | 失败后重试次数（不含首次） |
 
 ### output — RTSP 输出（可选，替代原 MJPEG 预览）
 
@@ -157,12 +157,15 @@ harness_cls / vest_cls 是**二级分类器**（process-mode=2，`operate-on-gie
                 ↓ 是（进入 ARMING）
        连续帧计数器 +1
                 ↓
-   达到 min_detection_count？
+   达到对应规则 min_detection_count？
                 ↓ 是
-   🚨 触发告警（进入 COOLDOWN）
+   🚨 触发告警（进入该规则 COOLDOWN，alert_type = 规则名）
    ├── 从 FrameCache 取该路最新已渲染帧（executor 线程 JPEG 编码）
     ├── 构建 payload（bbox + 违规属性 + frame_base64）
     └── Webhook POST（带 JPEG 证据帧）
+
+> 每条规则独立走上述状态机（独立冷却 / 连续帧计数 / 违规门限），互不竞争；
+> 触发时 payload 只带「携带该规则违规属性」的对象，`alert_type` 为该规则名。
 ```
 
 > **强制前提**：报警以**检测到人**为前提——探针只处理 person 置信度
@@ -173,6 +176,7 @@ harness_cls / vest_cls 是**二级分类器**（process-mode=2，`operate-on-gie
 
 ```json
 {
+  "alert_type": "no_vest",
   "camera_id": "1363",
   "camera_name": "Mobile Camera 1363",
   "timestamp": "2026-08-10T09:30:00+00:00",
@@ -182,9 +186,7 @@ harness_cls / vest_cls 是**二级分类器**（process-mode=2，`operate-on-gie
       "confidence": 0.87,
       "bbox": [840, 210, 1020, 760],
       "attributes": [
-        { "class": "no_helmet", "confidence": 0.91, "bbox": null },
-        { "class": "no_harness", "confidence": 0.5, "bbox": null },
-        { "class": "no_vest",    "confidence": 0.5, "bbox": null }
+        { "class": "no_vest", "confidence": 0.5, "bbox": null }
       ]
     }
   ],
@@ -192,6 +194,8 @@ harness_cls / vest_cls 是**二级分类器**（process-mode=2，`operate-on-gie
 }
 ```
 
+- `alert_type` = 触发的规则名（`no_helmet` / `no_vest` / `no_harness`），
+  由该规则独立状态机触发；`objects` 只含携带该违规属性的对象。
 - `frame_base64` 为告警时的 **JPEG 证据帧**（nvdsosd 已原生渲染检测框 + 违规标签，
   由 nvvideoconvert 采集后 executor 线程 `simplejpeg` 编码）。
   无证据帧时仍为 `null`（缓存尚未就绪，告警不丢）。
@@ -206,7 +210,10 @@ harness_cls / vest_cls 是**二级分类器**（process-mode=2，`operate-on-gie
   （`frame_base64=null`），避免无证据帧时丢告警。
 - **探针不阻塞流线程**：探针只做轻量决策 + nvdsosd 上色，JPEG / base64 / HTTP 由
   executor 线程池 + daemon 线程 fire-and-forget。
-- **每路摄像头独立状态机**：`dict[source_id → AlertManager]`，`source_id`
+- **按规则独立状态机**：每条规则（`no_helmet` / `no_vest` / `no_harness`）独立
+  冷却 / 连续帧计数 / 违规置信度门限，互不竞争；每路摄像头通过 `active_rules`
+  声明跟踪哪些规则（探针只计算激活维度）。
+- **每路摄像头独立实例**：`dict[source_id → AlertManager]`，`source_id`
   即 `nvstreammux` 的 pad 序号。
 - **证据帧 = 实时预览帧**：每路在 `nvstreamdemux` 后独立 `nvdsosd` 渲染，
   实时预览与证据帧共享同一渲染源，保证证据帧与操作者所见一致

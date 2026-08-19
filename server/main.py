@@ -9,7 +9,8 @@
 工作流程:
     1. 加载并校验 YAML 配置（摄像头仅支持 RTSP，可多路；N 路需动态 batch 引擎）
     2. 初始化日志
-    3. 创建 Webhook 推送器 + 每路摄像头一个 AlertManager（source_id → manager）
+    3. 解析告警规则（rules 节，每条独立状态机）→ 创建 Webhook 推送器 +
+       每路摄像头一个 AlertManager（内部按 active_rules 拆分独立规则状态机）
     4. 构建 DeepStream pipeline（两阶段架构）:
            RTSP 源×N → nvstreammux(batch=N) → nvinfer(pgie: person, 整帧, uid=1)
                      → nvinfer(helmet, 整帧, uid=3)
@@ -17,12 +18,13 @@
                      → nvinfer(vest_cls,   二级分类器, process-mode=2, uid=6, 裁剪 person 整框)
                      → nvstreamdemux → 每路:
                            nvdsosd → tee → [ shmsink(→ 单端口 RTSP server) | appsink(证据帧缓存) ]
-     5. SafetyProbe 挂在 vest_cls，把两阶段检测元数据翻译成 ObjectMeta 喂给
-        对应摄像头的 AlertManager（冷却 + 连续帧确认 + 异步 webhook 推送），
-        同时给对象上色（nvdsosd 原生渲染，demux 后每路独立，杜绝跨流污染）；
-        触发告警时带上该路缓存的最新已渲染帧，executor 线程 JPEG 编码 → payload。
-     6. 单端口 RTSP 输出（GstRtspServer）：所有摄像头共用 rtsp_port，
-        通过 /cam/{camera_id} 区分路径。
+      5. SafetyProbe 挂在 vest_cls，把两阶段检测元数据翻译成 ObjectMeta 喂给
+         对应摄像头的 AlertManager（按 active_rules 只算激活维度；冷却 + 连续帧
+         确认 + 异步 webhook 推送，alert_type=触发的规则名），同时给对象上色
+         （nvdsosd 原生渲染，demux 后每路独立，杜绝跨流污染）；
+         触发告警时带上该路缓存的最新已渲染帧，executor 线程 JPEG 编码 → payload。
+      6. 单端口 RTSP 输出（GstRtspServer）：所有摄像头共用 rtsp_port，
+         通过 /cam/{camera_id} 区分路径。
 """
 
 import argparse
@@ -46,9 +48,15 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from server.alert.manager import AlertManager
+from server.alert.rules import parse_rules
 from server.alert.webhook import WebhookAlerter
 from server.pipeline.frame_cache import FrameCache, add_evidence_capture
-from server.pipeline.probe import SafetyProbe
+from server.pipeline.probe import (
+    RULE_NO_HARNESS,
+    RULE_NO_HELMET,
+    RULE_NO_VEST,
+    SafetyProbe,
+)
 from server.pipeline.rtsp_server import SinglePortRtspServer
 from server.utils.logger import setup_logger
 
@@ -68,13 +76,28 @@ def load_config(config_path: str) -> dict:
 
 
 def _validate_config(config: dict, path: Path):
-    """校验: model 三配置 / 摄像头（RTSP 且 <=1 路，batch=1 引擎）。"""
+    """校验: model / rules / 摄像头(active_rules) / webhook。"""
     errors = []
 
     model = config.get("model") or {}
     for key in ("pgie_config", "helmet_config", "harness_cls_config", "vest_cls_config"):
         if not model.get(key):
             errors.append(f"model.{key} 为必填项")
+    person_conf = model.get("person_conf_threshold")
+    if person_conf is not None and not (
+        isinstance(person_conf, (int, float)) and 0.0 <= person_conf <= 1.0
+    ):
+        errors.append(f"model.person_conf_threshold 必须是 0~1 的置信度阈值，当前: {person_conf!r}")
+
+    rules_raw = config.get("rules")
+    rule_names: set[str] = set()
+    if not rules_raw:
+        errors.append("缺少 'rules' 节（至少定义一个告警规则）")
+    else:
+        try:
+            rule_names = set(parse_rules(rules_raw))
+        except ValueError as exc:
+            errors.append(str(exc))
 
     cameras = [c for c in config.get("cameras") or [] if c.get("enabled", True)]
     if not cameras:
@@ -85,14 +108,21 @@ def _validate_config(config: dict, path: Path):
                 errors.append(f"DeepStream 仅支持 RTSP 摄像头: {cam.get('id')} (type={cam.get('type')})")
             if not cam.get("rtsp_url"):
                 errors.append(f"cameras[].rtsp_url 为必填项 (type=rtsp): {cam.get('id')}")
+            active = cam.get("active_rules")
+            if active is not None:
+                if not isinstance(active, list) or not active:
+                    errors.append(f"cameras[{cam.get('id')}].active_rules 必须是非空列表")
+                else:
+                    for rule in active:
+                        if rule not in rule_names:
+                            errors.append(f"cameras[{cam.get('id')}].active_rules 引用了未定义的规则: {rule}")
 
-    if "alert" not in config:
-        errors.append("缺少 'alert' 节")
-    else:
-        for key in ("person_conf_threshold", "helmet_conf_threshold", "harness_conf_threshold", "vest_conf_threshold"):
-            val = config["alert"].get(key)
-            if val is not None and not (isinstance(val, (int, float)) and 0.0 <= val <= 1.0):
-                errors.append(f"alert.{key} 必须是 0~1 的置信度阈值，当前: {val!r}")
+    webhook = config.get("webhook") or {}
+    timeout = webhook.get("timeout")
+    if webhook.get("url") and timeout is not None and not (
+        isinstance(timeout, (int, float)) and timeout > 0
+    ):
+        errors.append(f"webhook.timeout 必须是正数，当前: {timeout!r}")
 
     if errors:
         raise ValueError(f"配置校验失败 ({path}):\n  " + "\n  ".join(errors))
@@ -189,26 +219,33 @@ def _serve(config: dict):
     )
     logger.info("startup safety_detection_server")
 
-    # PPE 告警置信度门槛（harness/vest 用于重写 sgie INI 的 classifier-threshold）
-    alert_cfg = config.get("alert", {})
-    person_conf_threshold = float(alert_cfg.get("person_conf_threshold", 0.4))
-    harness_conf_threshold = float(alert_cfg.get("harness_conf_threshold", 0.5))
-    vest_conf_threshold = float(alert_cfg.get("vest_conf_threshold", 0.5))
+    # 告警规则（独立状态机 + 各自阈值）; harness/vest 的 sgie classifier-threshold
+    # 由对应规则的 attribute_threshold 重写，helmet 空间关联门限同源。
+    rules = parse_rules(config.get("rules"))
 
+    # person 检测置信度门槛（模型级，低于视为噪声）
     model = config["model"]
+    person_conf_threshold = float(model.get("person_conf_threshold", 0.6))
+
     pgie_config = _anchor_ini_config(Path(_resolve(_PROJECT_ROOT, model["pgie_config"])))
     helmet_config = _anchor_ini_config(Path(_resolve(_PROJECT_ROOT, model["helmet_config"])))
     harness_cls_config = _anchor_ini_config(
         Path(_resolve(_PROJECT_ROOT, model["harness_cls_config"])),
-        classifier_threshold=harness_conf_threshold,
+        classifier_threshold=(
+            rules[RULE_NO_HARNESS].attribute_threshold
+            if RULE_NO_HARNESS in rules else None
+        ),
     )
     vest_cls_config = _anchor_ini_config(
         Path(_resolve(_PROJECT_ROOT, model["vest_cls_config"])),
-        classifier_threshold=vest_conf_threshold,
+        classifier_threshold=(
+            rules[RULE_NO_VEST].attribute_threshold
+            if RULE_NO_VEST in rules else None
+        ),
     )
 
     # Webhook 推送器（全局共享一个）
-    webhook_cfg = config.get("alert", {}).get("webhook", {})
+    webhook_cfg = config.get("webhook") or {}
     webhook = None
     if webhook_cfg.get("url"):
         webhook = WebhookAlerter(
@@ -220,25 +257,21 @@ def _serve(config: dict):
     else:
         logger.warning("未配置 Webhook URL，告警不会推送")
 
-    # 每路摄像头一个 AlertManager（source_id 即 nvstreammux 的 pad 序）
-    target_classes = alert_cfg.get("target_classes", ["no_helmet", "no_harness", "no_vest"])
-    # 空间关联置信度门槛（须 >= INI 的 pre-cluster-threshold=0.25）
-    helmet_conf_threshold = float(alert_cfg.get("helmet_conf_threshold", 0.5))
+    # 每路摄像头一个 AlertManager（内部按 active_rules 拆分独立状态机）
     cameras = [c for c in config.get("cameras") or [] if c.get("enabled", True)]
     alert_managers = {}
+    active_rules_by_source: dict[int, set[str]] = {}
     for i, cam in enumerate(cameras):
+        active_names = cam.get("active_rules") or list(rules)
+        active_rules_by_source[i] = set(active_names)
         alert_managers[i] = AlertManager(
             camera_id=cam["id"],
             camera_name=cam.get("name", cam["id"]),
-            target_classes=target_classes,
-            save_frame_overlay=alert_cfg.get("save_frame_overlay", False),
-            cooldown_seconds=alert_cfg.get("cooldown_seconds", 30),
-            min_detection_count=alert_cfg.get("min_detection_count", 3),
-            alert_type=alert_cfg.get("alert_type", "ppe"),
+            rules=[rules[name] for name in active_names],
             webhook=webhook,
         )
-        logger.info("startup camera={} src={} webhook={} target={}",
-                    cam["id"], cam.get("rtsp_url"), bool(webhook), target_classes)
+        logger.info("startup camera={} src={} webhook={} active_rules={}",
+                    cam["id"], cam.get("rtsp_url"), bool(webhook), active_names)
 
     # 异步 webhook executor（探针只做轻量决策，重活卸载到线程池）
     executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="webhook")
@@ -333,11 +366,17 @@ def _serve(config: dict):
 
     p.link("mux", "pgie", "helmet", "harness_cls", "vest_cls", "demux")
 
+    # no_helmet 空间关联门限 = rules.no_helmet.attribute_threshold（须 >= INI 的
+    # pre-cluster-threshold=0.25，否则低置信度框已在模型侧被裁掉）
+    helmet_conf_threshold = (
+        rules[RULE_NO_HELMET].attribute_threshold if RULE_NO_HELMET in rules else 0.5
+    )
     p.attach("vest_cls", Probe("safety-probe",
                                 SafetyProbe(alert_managers, executor=executor,
                                             frame_cache=frame_cache,
                                             helmet_conf_threshold=helmet_conf_threshold,
-                                            person_conf_threshold=person_conf_threshold)))
+                                            person_conf_threshold=person_conf_threshold,
+                                            active_rules_by_source=active_rules_by_source)))
     p.attach("vest_cls", "measure_fps_probe", name="fps-probe")
 
     # 单端口 RTSP 输出服务：所有摄像头共用 rtsp_port，路径区分 /cam/{camera_id}

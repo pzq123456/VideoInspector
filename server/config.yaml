@@ -1,7 +1,13 @@
 # =============================================================================
-# 安全帽 / 反光衣检测服务端 配置文件（DeepStream 三模型整帧检测）
+# 安全帽 / 反光衣检测服务端 配置文件（DeepStream 三模型整帧检测 + 二级分类器）
 # =============================================================================
 # 修改此文件后重启服务即可生效，无需改动任何代码。
+#
+# 告警策略按规则（rule）独立配置，互不竞争:
+#   rules.<rule>.cooldown_seconds    触发后冷却时长（秒）
+#   rules.<rule>.min_detection_count 连续违规帧数阈值（防单帧误报）
+#   rules.<rule>.attribute_threshold 违规置信度门限（同时作为 helmet 空间关联门限）
+#   每路摄像头用 active_rules 声明跟踪哪些规则，只计算/判定激活的维度。
 # =============================================================================
 
 # -----------------------------------------------------------------------------
@@ -21,65 +27,79 @@ model:
   helmet_config: "configs/pgie_config_helmet.txt"     # 安全帽（整帧, uid=3）
   harness_cls_config: "configs/sgie_config_harness_cls.txt"  # 安全带分类器（二级, uid=5）
   vest_cls_config: "configs/sgie_config_vest_cls.txt"        # 反光衣分类器（二级, uid=6）
+  person_conf_threshold: 0.6     # person 检测置信度门槛，低于此视为噪声（不判定、不渲染、不告警）
+
+# -----------------------------------------------------------------------------
+# 告警规则（每条规则独立状态机: 冷却 / 连续帧确认 / 违规置信度门限）
+# -----------------------------------------------------------------------------
+# harness/vest 二级分类器的 classifier-threshold 由对应规则的
+# attribute_threshold 启动时重写进 sgie INI；no_helmet 的
+# attribute_threshold 同时作为 helmet 框匹配 person 的空间关联门限。
+rules:
+  no_helmet:
+    cooldown_seconds: 10
+    min_detection_count: 3
+    attribute_threshold: 0.5
+
+  no_vest:
+    cooldown_seconds: 15
+    min_detection_count: 5
+    attribute_threshold: 0.5
+
+  no_harness:
+    cooldown_seconds: 5
+    min_detection_count: 2
+    attribute_threshold: 0.5
+
+# -----------------------------------------------------------------------------
+# Webhook 告警推送（alert_type 为触发的规则名，如 "no_vest"）
+# -----------------------------------------------------------------------------
+webhook:
+  url: "http://localhost:9999/api/ppe-alert"   # Webhook 接收地址
+  timeout: 10                                   # 请求超时（秒）
+  retries: 2                                    # 失败重试次数
 
 # -----------------------------------------------------------------------------
 # 摄像头列表
 # -----------------------------------------------------------------------------
 # 多路 RTSP 输入（引擎为动态 batch，支持任意路数；每路一个 AlertManager）。
-# type=rtsp 时需填 rtsp_url。
+# active_rules 只声明本路要判定/计算/渲染的规则（引用 rules 节的名称）。
 cameras:
   - id: "1363"
     name: "Mobile Camera 1363"
-    type: "rtsp"
     rtsp_url: "rtsp://118.140.234.166:8554/dahua1001182"
     enabled: true
+    active_rules: ["no_helmet", "no_vest", "no_harness"]
+
   - id: "1384"
     name: "Mobile Camera 1384"
-    type: "rtsp"
     rtsp_url: "rtsp://118.140.234.166:8554/dahua1001204"
     enabled: true
+    active_rules: ["no_helmet", "no_vest", "no_harness"]
+
   - id: "1385"
     name: "Mobile Camera 1385"
-    type: "rtsp"
     rtsp_url: "rtsp://118.140.234.166:8554/dahua1001723"
     enabled: true
+    active_rules: ["no_helmet", "no_vest", "no_harness"]
+
   - id: "671"
     name: "Mobile Camera 0671"
-    type: "rtsp"
     rtsp_url: "rtsp://118.140.234.166:8554/dahua1000330"
     enabled: true
+    active_rules: ["no_helmet"]
+
   - id: "676"
     name: "Mobile Camera 0676"
-    type: "rtsp"
     rtsp_url: "rtsp://118.140.234.166:8554/dahua1000325"
     enabled: true
+    active_rules: ["no_helmet", "no_vest", "no_harness"]
+
   - id: "891"
     name: "Mobile Camera 0891"
-    type: "rtsp"
     rtsp_url: "rtsp://118.140.234.166:8554/dahua1000352"
     enabled: true
-
-# -----------------------------------------------------------------------------
-# 告警参数
-# -----------------------------------------------------------------------------
-alert:
-  alert_type: "ppe"          # 与平台约定的告警类型（场景级，随 payload 原样输出）；和 target_classes 一起换
-  target_classes: ['no_helmet', 'no_harness', 'no_vest']  # 触发告警的违规属性名（匹配 ObjectMeta.attributes）
-  cooldown_seconds: 10           # 同一摄像头两次告警的最小间隔（秒）
-  min_detection_count: 3         # 连续检测到违规的帧数阈值（防止单帧误报）
-  save_frame_overlay: false      # 是否在证据帧上叠加摄像头名称/时间水印（证据帧已启用，告警带图）
-  helmet_conf_threshold: 0.5     # helmet 整帧框匹配 person 的最低置信度（空间关联用；
-                                  # 反光衣/安全带已改为二级分类器，其阈值由 sgie INI 的
-                                  # classifier-threshold 控制，probe 不再需要阈值参数）
-  person_conf_threshold: 0.6     # person 检测置信度门槛，低于此视为噪声（不判定、不渲染、不告警）
-  harness_conf_threshold: 0.6    # 安全带分类器门槛（重写到 sgie INI 的 classifier-threshold）
-  vest_conf_threshold: 0.6       # 反光衣分类器门槛（重写到 sgie INI 的 classifier-threshold）
-
-  webhook:
-    # url: "http://192.168.1.24:6034/protal/smoking-alarm/webhook"
-    url: "http://localhost:9999/api/smoke-alert"   # Webhook 接收地址
-    timeout: 10                                     # 请求超时（秒）
-    retries: 2                                      # 失败重试次数
+    active_rules: ["no_helmet", "no_vest"]
 
 # -----------------------------------------------------------------------------
 # RTSP 输入

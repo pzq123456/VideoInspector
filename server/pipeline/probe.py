@@ -6,6 +6,10 @@ DeepStream 探针 → 告警状态机桥
 AlertManager；同时给底层对象上色（nvdsosd 原生渲染，证据帧与实时预览
 共享同一渲染源）。
 
+按「规则」解耦：每路摄像头通过 active_rules 声明跟踪哪些规则，探针只计算
+激活维度的违规属性，其余维度跳过（省算力）；渲染判定（红/绿/蓝）也按
+「本路激活规则」而非全局三条。
+
 流程（空间关联逻辑源自 simple-demo3/two_stage_demo.py 已验证方案）:
   - 整帧检测（process-mode=1，结果按 gie-unique-id 挂在帧级）:
       uid=1  person（yolo26n, 只出 person）
@@ -15,17 +19,19 @@ AlertManager；同时给底层对象上色（nvdsosd 原生渲染，证据帧与
       uid=6  vest（vest/no_vest）
   - 第一趟: 收集 helmet 框的普通数值（class_id/conf/中心点），
     不持有元数据包装器（跨 pass 持有会段错误），同时给这些框上色。
-  - 第二趟: 每个 person 做 helmet 空间关联（检测框中心落在 person 框内），
-    并读取 harness/vest 分类器结果，
+  - 第二趟: 每个 person 对激活维度判定:
+      no_helmet → helmet 空间关联（检测框中心落在 person 框内，
+                  attribute_threshold 同时作为关联门限）,
+      no_harness / no_vest → 读取对应二级分类器结果,
     违规翻译为 AttributeMeta('no_helmet') / AttributeMeta('no_harness') /
     AttributeMeta('no_vest')，并按状态给 person 框上色
-    （红=任一违规 / 绿=三达标 / 蓝=有维度未知），
+    （红=任一激活违规 / 绿=激活维度全达标 / 蓝=有激活维度未知），
     违规者叠加文本标签（nvdsosd 的 per-object text_params）。
 
 渲染约定（证据帧 = 完整 OSD 渲染帧，与实时预览一致）:
-  - 任一违规（no_helmet / no_harness / no_vest）的人 → 红色框 + 违规标签
-  - 三达标（helmet 且 harness 且 vest）的人         → 绿色框
-  - 任一维度未知                                     → 蓝色框
+  - 任一激活规则违规的人 → 红色框 + 违规标签
+  - 激活规则全达标（如 helmet 且 vest）→ 绿色框
+  - 任一激活维度未知                               → 蓝色框
   - head/helmet 框                → 红=head(未戴), 绿=helmet(已戴)
 
 约束:
@@ -45,13 +51,18 @@ from loguru import logger
 from server.metadata import AttributeMeta, ObjectMeta
 
 RED = osd.Color(1.0, 0.0, 0.0, 1.0)    # 违规（no_helmet / no_harness / no_vest）
-GREEN = osd.Color(0.0, 1.0, 0.0, 1.0)  # 三达标（helmet 且 harness 且 vest）
-BLUE = osd.Color(0.0, 0.0, 1.0, 1.0)   # 有维度未知
+GREEN = osd.Color(0.0, 1.0, 0.0, 1.0)  # 激活规则全达标
+BLUE = osd.Color(0.0, 0.0, 1.0, 1.0)   # 有激活维度未知
 
 PERSON_UID = 1      # pgie (yolo26n)
 HELMET_UID = 3                # helmet 整帧检测器
 HARNESS_CLS_UID = 5   # harness 二级分类器（作用于 person）
 VEST_CLS_UID = 6      # vest 二级分类器（作用于 person）
+
+# 规则名（与 config.yaml rules 节一一对应，同时作为告警 AttributeMeta.name）
+RULE_NO_HELMET = "no_helmet"
+RULE_NO_HARNESS = "no_harness"
+RULE_NO_VEST = "no_vest"
 
 # helmet 框的类别 id 对应模型 labels.txt 的行序
 HELMET_CLASS_ID = 1   # helmet: 0=head(未戴), 1=helmet(已戴)
@@ -62,51 +73,61 @@ HARNESS_VIOLATION_LABELS = {"no_harness"}
 VEST_OK_LABELS = {"vest"}
 VEST_VIOLATION_LABELS = {"no_vest"}
 CLASSIFIER_LABELS = HARNESS_OK_LABELS | HARNESS_VIOLATION_LABELS | VEST_OK_LABELS | VEST_VIOLATION_LABELS
-# 分类器置信度解析失败时的回退值（= sgie INI 的 classifier-threshold）
+# 分类器置信度解析失败时的回退值（用于 payload 展示，判定由规则阈值负责）
 CLASSIFIER_FALLBACK_CONF = 0.5
 
 
 class SafetyProbe(BatchMetadataOperator):
-    """逐帧: 空间关联 → ObjectMeta 列表 → 对应摄像头的 AlertManager.handle()。
+    """逐帧: 按激活规则计算 → ObjectMeta 列表 → 对应摄像头的 AlertManager.handle()。
 
     Args:
         alert_managers: {source_id(int): AlertManager}，每路摄像头一个状态机。
         executor: ThreadPoolExecutor，透传给 AlertManager 用于异步 webhook。
         frame_cache: 可选 FrameCache，触发告警时取该 source 最新已渲染帧作 snapshot。
-        helmet_conf_threshold: 头盔框空间关联 person 的最低置信度（低于视为噪声）。
+        helmet_conf_threshold: no_helmet 规则的空间关联门限（= rules.no_helmet.
+            attribute_threshold，低于视为噪声）。
         person_conf_threshold: person 检测置信度门槛（低于视为噪声：不判定、不渲染、不告警）。
+        active_rules_by_source: {source_id: {规则名}}，每路摄像头激活的规则；
+            未列出的 source 默认全部规则（保持向后兼容）。
     """
 
     def __init__(self, alert_managers: dict,
                  executor: ThreadPoolExecutor | None = None,
                  frame_cache=None,
                  helmet_conf_threshold: float = 0.5,
-                 person_conf_threshold: float = 0.4):
+                 person_conf_threshold: float = 0.4,
+                 active_rules_by_source: dict[int, set[str]] | None = None):
         super().__init__()
         self._managers = alert_managers
         self._executor = executor
         # 证据帧缓存（FrameCache）: 触发告警时取该 source 最新已渲染帧作 snapshot。
         # None 表示未启用证据帧采集，行为与之前一致（frame_base64=null）。
         self._frame_cache = frame_cache
-        # 空间关联置信度门槛（来自 server/config.yaml alert.*，须 >= INI 的
-        # pre-cluster-threshold，否则低置信度框已在模型侧被裁掉、探针看不到）
+        # 空间关联置信度门槛（来自 config.yaml rules.no_helmet.attribute_threshold，
+        # 须 >= INI 的 pre-cluster-threshold，否则低置信度框已在模型侧被裁掉）
         self._helmet_conf_threshold = helmet_conf_threshold
         # person 检测置信度门槛（低于视为噪声：不参与关联/判定/渲染/告警）
         self._person_conf_threshold = person_conf_threshold
+        # 每路摄像头激活的规则（只计算/判定/渲染这些维度）
+        self._active_rules_by_source = active_rules_by_source or {}
 
     def handle_metadata(self, batch_meta):
         for frame_meta in batch_meta.frame_items:
+            source_id = frame_meta.source_id
+            active = self._active_rules_by_source.get(source_id, _ALL_RULES)
+
             # 第一趟: 收集 helmet 检测框的普通数值，避免持有元数据包装器；
             # 同时给这些框上色（nvdsosd 原生渲染，与证据帧/预览共享）
             helmet_boxes = []  # [(class_id, conf, cx, cy)]
-            for o in frame_meta.object_items:  # 一次性迭代器
-                if o.unique_component_id == HELMET_UID:
-                    o.rect_params.border_color = (
-                        GREEN if o.class_id == HELMET_CLASS_ID else RED
-                    )
-                    helmet_boxes.append(self._box_vals(o))
+            if RULE_NO_HELMET in active:
+                for o in frame_meta.object_items:  # 一次性迭代器
+                    if o.unique_component_id == HELMET_UID:
+                        o.rect_params.border_color = (
+                            GREEN if o.class_id == HELMET_CLASS_ID else RED
+                        )
+                        helmet_boxes.append(self._box_vals(o))
 
-            # 第二趟: 每个 person → ObjectMeta（违规进 attributes）+ 状态上色
+            # 第二趟: 每个 person → ObjectMeta（激活维度违规进 attributes）+ 状态上色
             objects: list[ObjectMeta] = []
             for obj in frame_meta.object_items:
                 if obj.unique_component_id != PERSON_UID:
@@ -114,45 +135,51 @@ class SafetyProbe(BatchMetadataOperator):
                 if obj.confidence < self._person_conf_threshold:
                     continue
 
-                h, h_conf = self._helmet_status(
-                    self._matched_conf(obj, helmet_boxes, self._helmet_conf_threshold)
-                )
-                har_status, har_label, har_conf = self._classifier_status(
-                    obj.classifier_items, HARNESS_CLS_UID,
-                    HARNESS_OK_LABELS, HARNESS_VIOLATION_LABELS,
-                )
-                vest_status, vest_label, vest_conf = self._classifier_status(
-                    obj.classifier_items, VEST_CLS_UID,
-                    VEST_OK_LABELS, VEST_VIOLATION_LABELS,
-                )
+                attrs: list[AttributeMeta] = []
+                statuses: list[str | None] = []  # 激活维度各自状态: "ok"/"violation"/None
 
-                attrs = []
-                if h == "no_helmet":
-                    attrs.append(AttributeMeta("no_helmet", h_conf))
-                if har_status == "violation":
-                    attrs.append(AttributeMeta(
-                        har_label,
-                        har_conf if har_conf is not None else CLASSIFIER_FALLBACK_CONF,
-                    ))
-                if vest_status == "violation":
-                    attrs.append(AttributeMeta(
-                        vest_label,
-                        vest_conf if vest_conf is not None else CLASSIFIER_FALLBACK_CONF,
-                    ))
+                if RULE_NO_HELMET in active:
+                    matched = self._matched_conf(
+                        obj, helmet_boxes, self._helmet_conf_threshold
+                    )
+                    h_status, h_attr, h_conf = self._helmet_status(matched)
+                    if h_attr:
+                        attrs.append(AttributeMeta(h_attr, h_conf))
+                    statuses.append(h_status)
 
-                # 任一违规=红；三达标=绿；有维度未知=蓝
-                violation = (
-                    h == "no_helmet"
-                    or har_status == "violation"
-                    or vest_status == "violation"
-                )
+                if RULE_NO_HARNESS in active:
+                    har_status, har_label, har_conf = self._classifier_status(
+                        obj.classifier_items, HARNESS_CLS_UID,
+                        HARNESS_OK_LABELS, HARNESS_VIOLATION_LABELS,
+                    )
+                    if har_status == "violation":
+                        attrs.append(AttributeMeta(
+                            har_label,
+                            har_conf if har_conf is not None else CLASSIFIER_FALLBACK_CONF,
+                        ))
+                    statuses.append(har_status)
+
+                if RULE_NO_VEST in active:
+                    vest_status, vest_label, vest_conf = self._classifier_status(
+                        obj.classifier_items, VEST_CLS_UID,
+                        VEST_OK_LABELS, VEST_VIOLATION_LABELS,
+                    )
+                    if vest_status == "violation":
+                        attrs.append(AttributeMeta(
+                            vest_label,
+                            vest_conf if vest_conf is not None else CLASSIFIER_FALLBACK_CONF,
+                        ))
+                    statuses.append(vest_status)
+
+                # 任一激活违规=红；激活维度全达标=绿；有激活维度未知=蓝
+                violation = any(s == "violation" for s in statuses)
                 obj.rect_params.border_width = 2
                 if violation:
                     obj.rect_params.border_color = RED
                     self._set_osd_label(
                         obj, " ".join(a.name for a in attrs)
                     )
-                elif h == "helmet" and har_status == "ok" and vest_status == "ok":
+                elif statuses and all(s == "ok" for s in statuses):
                     obj.rect_params.border_color = GREEN
                 else:
                     obj.rect_params.border_color = BLUE
@@ -169,17 +196,17 @@ class SafetyProbe(BatchMetadataOperator):
                     attributes=tuple(attrs),
                 ))
 
-            manager = self._managers.get(frame_meta.source_id)
+            manager = self._managers.get(source_id)
             if manager is not None:
                 # 快照只取缓存引用（不拷贝），仅在真正触发告警时才被读取/编码
                 snapshot = (
-                    self._frame_cache.latest(frame_meta.source_id)
+                    self._frame_cache.latest(source_id)
                     if self._frame_cache else None
                 )
                 manager.handle(objects, snapshot=snapshot, executor=self._executor)
             elif objects:
                 logger.debug("source_id={} 无对应 AlertManager，跳过告警判定",
-                             frame_meta.source_id)
+                             source_id)
 
     # ------------------------------------------------------------------
     # 静态工具：与 simple-demo3 的 SafetyMarker 同源
@@ -227,13 +254,14 @@ class SafetyProbe(BatchMetadataOperator):
         """戴帽状态; helmet 优先（同时命中 head 与 helmet 时按已戴帽处理）。
 
         Returns:
-            (status, conf): status ∈ {"helmet", "no_helmet", None}
+            (status, attr_name, conf): status ∈ {"ok", "violation", None}，
+            attr_name 仅违规时为 RULE_NO_HELMET，否则 None。
         """
         if HELMET_CLASS_ID in matched:
-            return "helmet", matched[HELMET_CLASS_ID]
+            return "ok", None, matched[HELMET_CLASS_ID]
         if HEAD_CLASS_ID in matched:
-            return "no_helmet", matched[HEAD_CLASS_ID]
-        return None, None
+            return "violation", RULE_NO_HELMET, matched[HEAD_CLASS_ID]
+        return None, None, None
 
     # 每个 uid 只 DEBUG 一次 get_n_label 原始格式（避免热路径逐人逐帧刷屏）
     _logged_label_formats: set[int] = set()
@@ -287,3 +315,6 @@ class SafetyProbe(BatchMetadataOperator):
             except ValueError:
                 pass
         return label, conf
+
+
+_ALL_RULES = {RULE_NO_HELMET, RULE_NO_VEST, RULE_NO_HARNESS}

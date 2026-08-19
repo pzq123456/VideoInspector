@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 Webhook 接收器 — 模拟第三方消费端
-- 接收检测服务端推送的告警（含 base64 证据帧）
-- 解码并保存证据帧到本地磁盘
+- 接收检测服务端推送的告警（含 alert_type 规则名，如 no_vest/no_helmet 及 base64 证据帧）
+- 解码并保存证据帧到本地磁盘，帧文件名 <timestamp>_<alert_type>.jpg
 - 运维日志 → loguru；推送数据 → 手动写 JSONL
 
 启动方式:
@@ -61,11 +61,12 @@ class WebhookHandler(BaseHTTPRequestHandler):
         if frame_b64 and _save_dir:
             try:
                 camera_id = payload.get("camera_id", "unknown")
+                alert_type = payload.get("alert_type") or "unknown"
                 ts = payload.get("timestamp", datetime.now(timezone.utc).isoformat())
                 ts_str = ts[:19].replace(":", "").replace("T", "_")
                 frame_dir = _save_dir / camera_id
                 frame_dir.mkdir(parents=True, exist_ok=True)
-                frame_path = frame_dir / f"{ts_str}.jpg"
+                frame_path = frame_dir / f"{ts_str}_{alert_type}.jpg"
                 frame_path.write_bytes(base64.b64decode(frame_b64))
                 frame_saved_to = str(frame_path)
                 logger.info("帧已保存: {}", frame_path)
@@ -100,8 +101,9 @@ class WebhookHandler(BaseHTTPRequestHandler):
         """通过 logger 输出告警摘要，无阻塞 flush。"""
         objects = payload.get("objects", [])  # 修复: 键名为 "objects" 而非 "detections"
         logger.info(
-            "Alert #{} | Camera: {} ({}) | Objects: {} | Frame: {}",
+            "Alert #{} | Type: {} | Camera: {} ({}) | Objects: {} | Frame: {}",
             count,
+            payload.get("alert_type", "?"),
             payload.get("camera_name", "?"),
             payload.get("camera_id", "?"),
             len(objects),
