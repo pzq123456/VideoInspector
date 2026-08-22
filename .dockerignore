@@ -1,4 +1,5 @@
 # 构建上下文排除项（context = 项目根目录）
+# 部署资产（config/models/generated/logs）经 docker-compose 卷挂载注入，不进镜像层
 .git
 .gitignore
 __pycache__/
@@ -8,4 +9,10 @@ logs/
 alerts/
 local/
 tmp/
-.devcample/
+.devcontainer/
+.opencode/
+notes/
+skills/
+deploy/models/
+deploy/generated/
+deploy/logs/

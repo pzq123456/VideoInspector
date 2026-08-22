@@ -7,23 +7,31 @@
 ## 快速开始
 
 ```bash
-python tools/model_build.py --config server/config.yaml   # 编译模型产物到 generated/
-python -m server.main --config server/config.yaml          # 启动服务
+python tools/model_build.py --config deploy/config.yaml   # 编译模型产物到 <部署根>/generated/（增量）
+python -m server.main --config deploy/config.yaml          # 启动服务
 python local/webhook_receiver.py                           # （可选）模拟消费端
 ```
+
+「部署根」= config.yaml 所在目录（`deploy/`），所有相对路径与产物都锚定于此：
+`deploy/models/` 放 .pt 源，`deploy/generated/` 收纳全部可重建产物。
 
 ## 目录
 
 ```
+deploy/
+├── config.yaml        # 唯一事实来源：模型拓扑 + 规则 + 摄像头（部署根锚点）
+├── models/            # .pt 模型源（人工维护，不入库）
+└── generated/         # 全部构建产物（可整目录删除重建）
+    ├── common/libnvds_yolo_nms.so
+    └── <name>/{best.onnx, best_dyn_fp16.engine, labels.txt, pgie|sgie_config.txt}
 server/
 ├── main.py            # 入口：读 config → 构建 pipeline → 运行
-├── config.yaml        # 唯一事实来源：模型拓扑 + 规则 + 摄像头
 ├── model_spec.py      # model.gies 的声明式解析/校验
 ├── metadata.py        # 数据契约 ObjectMeta / AttributeMeta
 ├── pipeline/          # probe(元数据→告警) / frame_cache(证据帧) / rtsp_server(输出)
 ├── alert/             # manager(状态机) / rules(规则配置) / webhook(推送)
 └── utils/logger.py
-tools/model_build.py   # pt→onnx→(class0 交换)→engine→generated/
+tools/model_build.py   # pt→onnx→(class0 交换)→engine→generated/（增量 + --force）
 ```
 
 ## 配置要点
@@ -35,9 +43,9 @@ model:
   person_conf_threshold: 0.6
   gies:                                  # 模型拓扑；只写报警类 violation，不写全量 labels
     person:      { kind: detector,   source: models/person/yolo26n.pt, uid: 1 }
-    helmet:      { kind: detector,   source: models/helmet/best.pt,    uid: 3, violation: head }
-    harness_cls: { kind: classifier, source: models/original/harness/.../best.pt, uid: 5, violation: no_harness }
-    vest_cls:    { kind: classifier, source: models/original/vest/.../best.pt,   uid: 6, violation: no_vest }
+    helmet:      { kind: detector,   source: models/helmet/.../best.pt, uid: 3, violation: head }
+    harness_cls: { kind: classifier, source: models/harness/.../best.pt, uid: 5, violation: no_harness }
+    vest_cls:    { kind: classifier, source: models/vest/.../best.pt,   uid: 6, violation: no_vest }
 
 rules:                                  # 每条独立状态机；gie 引用上面的模型
   no_helmet:  { gie: helmet,      cooldown_seconds: 10, min_detection_count: 3, attribute_threshold: 0.5 }
@@ -87,4 +95,4 @@ classifier 属性置信度固定回退 0.5（pyservicemaker 拿不到分类概�
 
 - 告警以「检测到人」为前提：探针跳过 person 置信度 < `person_conf_threshold` 的实体。
 - 探针不阻塞流线程：JPEG/HTTP 由 executor + daemon 线程异步处理。
-- 生成物（`generated/`、`models/*/engine`、`models/*/onnx`）皆可由 config 重建，不入库。
+- 生成物（`deploy/generated/` 全目录）皆可由 config + models/ 重建，不入库。

@@ -1,8 +1,13 @@
+# 运行期依赖（小）+ 构建期依赖（torch 全家桶，供容器启动时 pt→onnx 导出）。
+# 基础镜像已自带 pyservicemaker/numpy/scipy/gi/httpx 等，勿重复声明；
+# numpy 不钉死（实测 2.5.x 与 pyservicemaker 兼容），随 torch 栈传递解析。
 PyYAML==6.0.3
 loguru==0.7.3
 opencv-python-headless==5.0.0.93
 simplejpeg==1.9.0
 --extra-index-url https://download.pytorch.org/whl/cu130
-torch>=2.0.0
-torchvision>=0.15.0
-ultralytics>=8.0.0
+torch==2.13.0+cu130
+torchvision==0.28.0+cu130
+ultralytics==8.4.118
+# 注意: ultralytics 会连带拉取 GUI 版 opencv-python 覆盖 cv2 同路径，
+# Dockerfile 中在安装 ultralytics 之后强制重装 headless 版收尾。

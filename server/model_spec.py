@@ -7,7 +7,8 @@ config.yaml 的 model.gies 节是模型拓扑的单一事实来源：
 - violation       报警类（即「no_xxx」对应的模型类别名；锚点检测器无此字段）
 
 运行期（server/main.py、probe.py）只消费 GieSpec，不关心模型怎么编译；
-编译期（tools/model_build.py --config）据此生成 generated/<name>/ 下的 INI + labels.txt。
+编译期（tools/model_build.py --config）据此生成 <部署根>/generated/<name>/ 下的 INI + labels.txt。
+部署根 = config.yaml 所在目录；source 相对路径与产物路径均相对部署根解析。
 """
 
 from __future__ import annotations
@@ -26,7 +27,7 @@ class GieSpec:
 
     name: str
     kind: str                       # detector | classifier
-    source: str                     # 模型来源 .pt/.onnx（编译入口，相对项目根）
+    source: str                     # 模型来源 .pt/.onnx（编译入口，相对部署根 = config 所在目录）
     uid: int                        # gie-unique-id，全局唯一
     violation: str | None = None    # 报警类标签（classifier 必填；detector 报警模型必填）
 

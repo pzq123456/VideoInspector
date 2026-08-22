@@ -1,13 +1,14 @@
 # =============================================================================
 # 安全帽 / 反光衣 / 安全带检测服务端 配置文件
 # =============================================================================
-# 修改此文件后:
-#   1. python tools/model_build.py --config server/config.yaml   # 编译模型产物
-#   2. python -m server.main --config server/config.yaml          # 启动服务
+# 本文件是「部署根」：所有相对路径（source 等）均相对本文件所在目录解析，
+# 产物统一写入 ./generated/。修改此文件后:
+#   1. python tools/model_build.py --config deploy/config.yaml   # 编译模型产物（增量，--force 全量重建）
+#   2. python -m server.main --config deploy/config.yaml          # 启动服务
 #
 # model.gies 是模型拓扑的单一事实来源，每项声明:
 #   kind      detector(整帧检测) | classifier(二级分类，作用于 person 裁剪框)
-#   source    模型来源 .pt（编译入口）
+#   source    模型来源 .pt（编译入口，相对本文件所在目录）
 #   uid       gie-unique-id（全局唯一）
 #   violation 报警类标签（只写报警类，如 head/no_vest/no_harness；锚点无此字段）
 #             classifier 若 violation 不在 index0，构建工具自动交换输出通道使其落到 class0
@@ -24,19 +25,19 @@ model:
 
     helmet:                                    # 安全帽整帧检测
       kind: detector
-      source: models/helmet/best.pt
+      source: models/helmet/yolo26s_helm_20260804_0844/weights/best.pt
       uid: 3
       violation: head                          # head = 未戴帽（报警类）
 
     harness_cls:                               # 安全带二级分类器
       kind: classifier
-      source: models/original/harness/yolo26m_cls_harness_20260817_0547/weights/best.pt
+      source: models/harness/yolo26m_cls_harness_20260817_0547/weights/best.pt
       uid: 5
       violation: no_harness                    # 原 index1 → 构建期自动换到 class0
 
     vest_cls:                                  # 反光衣二级分类器（新模型，修复 §6 预处理脆弱）
       kind: classifier
-      source: models/original/vest/yolo26mcls_ppeVest_20260820_0923/weights/best.pt
+      source: models/vest/yolo26mcls_ppeVest_20260820_0923/weights/best.pt
       uid: 6
       violation: no_vest                       # 原 index0，无需交换
 

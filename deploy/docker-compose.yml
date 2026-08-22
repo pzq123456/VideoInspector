@@ -1,23 +1,36 @@
+# =============================================================================
+# 生产编排: 镜像只含代码+依赖；部署根四件套经卷挂载注入 /app/deploy/。
+# 使用: cd deploy && docker compose up -d --build
+#   - 首次启动自动增量构建引擎（分钟级），之后重启秒级跳过
+#   - 换模型 = 替换 models/ 下 .pt → 重启容器即自动重建加载
+# =============================================================================
 services:
   detector:
     build:
       context: ..
-      dockerfile: Dockerfile
+      dockerfile: deploy/Dockerfile
     image: safety-detector:latest
     container_name: safety-detector
     runtime: nvidia
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
-      - SAFETY_LOG_FILE=/logs/server.log   # 日志落到宿主机映射的 deploy/logs/
+      # webhook 若跑在宿主机: 把 config.yaml 的 url 改为
+      #   http://host.docker.internal:9999/api/ppe-alert  （extra_hosts 已放通）
+      # 或改用 network_mode: host，保持 localhost 不变（端口映射随之失效）
     shm_size: "1g"
 
     volumes:
-      - ../models:/app/models     # 模型产物（引擎/parser/labels）——宿主机构建, 重启容器即加载新模型
-      - ../configs:/app/configs   # 生成的 nvinfer 配置
-      - ./logs:/logs
+      - ./config.yaml:/app/deploy/config.yaml:ro   # 配置（改后重启生效，无需重建镜像）
+      - ./models:/app/deploy/models:ro             # .pt 模型源
+      - ./generated:/app/deploy/generated          # 引擎/onnx/INI —— 宿主机持久化
+      - ./logs:/app/deploy/logs
 
     ports:
-      - "18003:18003/tcp"
-      - "18004-18020:18004-18020/udp"
+      - "18003:8554/tcp"                # config output.rtsp_port=8554 → 宿主沿用旧端口契约
+      - "18004-18020:18004-18020/udp"   # RTSP UDP 传输段
+
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
     restart: unless-stopped

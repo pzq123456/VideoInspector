@@ -3,8 +3,9 @@
 安全帽 / 反光衣 / 安全带检测服务端入口（DeepStream 两阶段：整帧检测 + 二级分类器）
 
 启动方式:
-    python tools/model_build.py --config server/config.yaml   # ① 编译模型产物（generated/）
-    python -m server.main --config server/config.yaml          # ② 启动服务
+    python tools/model_build.py --config deploy/config.yaml   # ① 编译模型产物（generated/，增量）
+    python -m server.main --config deploy/config.yaml          # ② 启动服务
+    （容器内由 SAFETY_CONFIG 指定配置；部署根 = config.yaml 所在目录）
 
 工作流程:
     1. 加载并校验 YAML 配置（model.gies 声明模型拓扑；rules 每条独立状态机）
@@ -128,12 +129,12 @@ def _validate_config(config: dict, path: Path):
 
 
 def _resolve(base: Path, p: str) -> str:
-    """把配置里的相对路径解析为绝对路径（相对项目根目录）。"""
+    """把配置里的相对路径解析为绝对路径（相对部署根 = config.yaml 所在目录）。"""
     return p if Path(p).is_absolute() else str(base / p)
 
 
-# nvinfer 解析 INI 内相对路径时基于进程 CWD，这里在启动时把模型路径显式
-# 锚定到项目根（_PROJECT_ROOT，开发容器=/workspaces/VideoInspector，镜像=/app），
+# nvinfer 解析 INI 内相对路径时基于进程 CWD，这里在启动时把模型路径显式锚定到
+# 部署根（= config.yaml 所在目录：开发环境为 deploy/，镜像内为挂载的配置目录），
 # 使同一份可移植 INI 两端通用，不依赖启动目录。
 _MODEL_PATH_KEYS = ("onnx-file", "model-engine-file", "labelfile-path", "custom-lib-path")
 # 运行期必须存在、缺失即报错（onnx-file 仅用于重建引擎，不在此列）
@@ -142,8 +143,8 @@ _REQUIRED_PATH_KEYS = ("model-engine-file", "custom-lib-path", "labelfile-path")
 _patched_dir: Path | None = None
 
 
-def _anchor_ini_config(src: Path, classifier_threshold: float | None = None) -> str:
-    """把 INI 内相对项目根的模型路径补全为绝对路径，返回 patched 文件路径。"""
+def _anchor_ini_config(src: Path, base: Path, classifier_threshold: float | None = None) -> str:
+    """把 INI 内相对部署根的模型路径补全为绝对路径，返回 patched 文件路径。"""
     global _patched_dir
     if _patched_dir is None:
         _patched_dir = Path(tempfile.mkdtemp(prefix="safety-configs-"))
@@ -154,7 +155,7 @@ def _anchor_ini_config(src: Path, classifier_threshold: float | None = None) -> 
         if m and m.group(1) in _MODEL_PATH_KEYS:
             val = m.group(2).strip()
             if val and not Path(val).is_absolute():
-                val = str(_PROJECT_ROOT / val)
+                val = str(base / val)
                 raw = f"{m.group(1)}={val}"
             resolved[m.group(1)] = val
         elif m and classifier_threshold is not None and m.group(1) == "classifier-threshold":
@@ -190,14 +191,17 @@ def _clean_stale_shm_sockets(socket_path: str, logger) -> None:
 # ============================================================================
 # 子进程: 构建并运行 DeepStream pipeline
 # ============================================================================
-def _serve(config: dict):
+def _serve(config: dict, deploy_root: Path):
     os.environ.setdefault("GST_DEBUG", "0")
 
     log_cfg = config.get("log") or {}
+    log_file = os.environ.get("SAFETY_LOG_FILE") or log_cfg.get("file")
+    if log_file and not Path(log_file).is_absolute():
+        log_file = str(deploy_root / log_file)
     logger = setup_logger(
         name="safety_server",
         level=log_cfg.get("level", "INFO"),
-        log_file=os.environ.get("SAFETY_LOG_FILE") or log_cfg.get("file"),
+        log_file=log_file,
     )
     logger.info("startup safety_detection_server")
 
@@ -273,7 +277,8 @@ def _serve(config: dict):
     last_infer = None
     for spec in ordered:
         ini = _anchor_ini_config(
-            Path(_resolve(_PROJECT_ROOT, spec.config_path())),
+            Path(_resolve(deploy_root, spec.config_path())),
+            base=deploy_root,
             classifier_threshold=(
                 gie_thresholds.get(spec.name) if spec.kind == KIND_CLASSIFIER else None
             ),
@@ -367,15 +372,17 @@ def main():
     parser = argparse.ArgumentParser(description="安全帽/反光衣检测服务端 (DeepStream)")
     parser.add_argument(
         "--config", "-c",
-        default=str(_PROJECT_ROOT / "server" / "config.yaml"),
-        help="配置文件路径（默认: server/config.yaml）",
+        default=os.environ.get("SAFETY_CONFIG")
+                or str(_PROJECT_ROOT / "deploy" / "config.yaml"),
+        help="配置文件路径（默认: $SAFETY_CONFIG 或 <项目根>/deploy/config.yaml）",
     )
     args = parser.parse_args()
 
     print(f"加载配置: {args.config}")
     config = load_config(args.config)
+    deploy_root = Path(args.config).resolve().parent
 
-    proc = Process(target=_serve, args=(config,))
+    proc = Process(target=_serve, args=(config, deploy_root))
     try:
         proc.start()
         proc.join()
