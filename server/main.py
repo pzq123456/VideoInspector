@@ -1,30 +1,22 @@
 #!/usr/bin/env python3
 """
-安全帽 / 反光衣检测服务端入口（DeepStream 两阶段：整帧检测 + 二级分类器）
+安全帽 / 反光衣 / 安全带检测服务端入口（DeepStream 两阶段：整帧检测 + 二级分类器）
 
 启动方式:
-    python -m server.main                  # 使用默认配置 server/config.yaml
-    python -m server.main --config my.yaml # 指定配置文件
+    python tools/model_build.py --config server/config.yaml   # ① 编译模型产物（generated/）
+    python -m server.main --config server/config.yaml          # ② 启动服务
 
 工作流程:
-    1. 加载并校验 YAML 配置（摄像头仅支持 RTSP，可多路；N 路需动态 batch 引擎）
+    1. 加载并校验 YAML 配置（model.gies 声明模型拓扑；rules 每条独立状态机）
     2. 初始化日志
-    3. 解析告警规则（rules 节，每条独立状态机）→ 创建 Webhook 推送器 +
-       每路摄像头一个 AlertManager（内部按 active_rules 拆分独立规则状态机）
-    4. 构建 DeepStream pipeline（两阶段架构）:
-           RTSP 源×N → nvstreammux(batch=N) → nvinfer(pgie: person, 整帧, uid=1)
-                     → nvinfer(helmet, 整帧, uid=3)
-                     → nvinfer(harness_cls, 二级分类器, process-mode=2, uid=5, 裁剪 person 整框)
-                     → nvinfer(vest_cls,   二级分类器, process-mode=2, uid=6, 裁剪 person 整框)
-                     → nvstreamdemux → 每路:
-                           nvdsosd → tee → [ shmsink(→ 单端口 RTSP server) | appsink(证据帧缓存) ]
-      5. SafetyProbe 挂在 vest_cls，把两阶段检测元数据翻译成 ObjectMeta 喂给
-         对应摄像头的 AlertManager（按 active_rules 只算激活维度；冷却 + 连续帧
-         确认 + 异步 webhook 推送，alert_type=触发的规则名），同时给对象上色
-         （nvdsosd 原生渲染，demux 后每路独立，杜绝跨流污染）；
-         触发告警时带上该路缓存的最新已渲染帧，executor 线程 JPEG 编码 → payload。
-      6. 单端口 RTSP 输出（GstRtspServer）：所有摄像头共用 rtsp_port，
-         通过 /cam/{camera_id} 区分路径。
+    3. 解析告警规则（每条独立状态机）→ Webhook 推送器 + 每路摄像头一个 AlertManager
+    4. 构建 DeepStream pipeline（由 model.gies 驱动，nvinfer 间补 queue，对齐官方 test5）:
+           RTSP 源×N → nvstreammux(batch=N) → [detector/classifier 链] → nvstreamdemux
+           → 每路: nvdsosd → tee → [ shmsink(→ RTSP) | appsink(证据帧) ]
+    5. SafetyProbe 挂在最后一个 nvinfer，把两阶段检测元数据翻译成 ObjectMeta 喂给
+       对应摄像头的 AlertManager（按 active_rules 只算激活维度；冷却 + 连续帧确认 +
+       异步 webhook，alert_type=触发的规则名），同时给对象上色。
+    6. 单端口 RTSP 输出（GstRtspServer），/cam/{camera_id} 区分路径。
 """
 
 import argparse
@@ -50,13 +42,9 @@ if str(_PROJECT_ROOT) not in sys.path:
 from server.alert.manager import AlertManager
 from server.alert.rules import parse_rules
 from server.alert.webhook import WebhookAlerter
+from server.model_spec import KIND_CLASSIFIER, KIND_DETECTOR, anchor_uid, parse_gies
 from server.pipeline.frame_cache import FrameCache, add_evidence_capture
-from server.pipeline.probe import (
-    RULE_NO_HARNESS,
-    RULE_NO_HELMET,
-    RULE_NO_VEST,
-    SafetyProbe,
-)
+from server.pipeline.probe import SafetyProbe
 from server.pipeline.rtsp_server import SinglePortRtspServer
 from server.utils.logger import setup_logger
 
@@ -76,13 +64,20 @@ def load_config(config_path: str) -> dict:
 
 
 def _validate_config(config: dict, path: Path):
-    """校验: model / rules / 摄像头(active_rules) / webhook。"""
+    """校验: model.gies / rules / 摄像头(active_rules) / webhook。"""
     errors = []
 
     model = config.get("model") or {}
-    for key in ("pgie_config", "helmet_config", "harness_cls_config", "vest_cls_config"):
-        if not model.get(key):
-            errors.append(f"model.{key} 为必填项")
+    gies: dict = {}
+    gies_raw = model.get("gies")
+    if not gies_raw:
+        errors.append("model.gies 为必填项（至少声明一个锚点检测器）")
+    else:
+        try:
+            gies = parse_gies(gies_raw)
+        except ValueError as exc:
+            errors.append(str(exc))
+
     person_conf = model.get("person_conf_threshold")
     if person_conf is not None and not (
         isinstance(person_conf, (int, float)) and 0.0 <= person_conf <= 1.0
@@ -95,7 +90,11 @@ def _validate_config(config: dict, path: Path):
         errors.append("缺少 'rules' 节（至少定义一个告警规则）")
     else:
         try:
-            rule_names = set(parse_rules(rules_raw))
+            rules = parse_rules(rules_raw)
+            rule_names = set(rules)
+            for rule in rules.values():
+                if rule.gie not in gies:
+                    errors.append(f"rules.{rule.name}.gie 引用了未定义的模型: {rule.gie}")
         except ValueError as exc:
             errors.append(str(exc))
 
@@ -144,11 +143,7 @@ _patched_dir: Path | None = None
 
 
 def _anchor_ini_config(src: Path, classifier_threshold: float | None = None) -> str:
-    """把 INI 内相对项目根的模型路径补全为绝对路径，返回 patched 文件路径。
-
-    fail fast: 锚定后校验运行期必需的引擎/parser/标签文件存在，
-    缺失时给出清晰报错（而非 nvinfer 的模糊告警）。
-    """
+    """把 INI 内相对项目根的模型路径补全为绝对路径，返回 patched 文件路径。"""
     global _patched_dir
     if _patched_dir is None:
         _patched_dir = Path(tempfile.mkdtemp(prefix="safety-configs-"))
@@ -172,7 +167,7 @@ def _anchor_ini_config(src: Path, classifier_threshold: float | None = None) -> 
     ]
     if missing:
         raise FileNotFoundError(
-            f"{src.name} 引用的模型产物缺失（请确认根目录 models/ 已拷全）:\n  "
+            f"{src.name} 引用的模型产物缺失（请先运行 tools/model_build.py --config）:\n  "
             + "\n  ".join(missing)
         )
 
@@ -182,15 +177,7 @@ def _anchor_ini_config(src: Path, classifier_threshold: float | None = None) -> 
 
 
 def _clean_stale_shm_sockets(socket_path: str, logger) -> None:
-    """删除上次进程残留的 shm 控制 socket（base 与 .N 变体）。
-
-    GStreamer shmsink 在 bind() 遇到 EADDRINUSE（上次进程异常退出后残留的
-    socket 文件）时会**静默退避**成 socket-path.0/.1/...（见 gst-plugins-bad
-    sys/shm/shmpipe.c sp_writer_create: `snprintf(..., "%s.%d", path, i)`），
-    而 RTSP 侧 shmsrc 仍连接原始路径 —— 两端路径错位，预览报 503
-    "Service Unavailable"。每次启动前清掉 base 及所有 .N 变体，
-    保证 shmsink 总是绑定 shmsrc 期望的原始路径。
-    """
+    """删除上次进程残留的 shm 控制 socket（base 与 .N 变体）。"""
     for p in glob.glob(socket_path) + glob.glob(f"{socket_path}.*"):
         try:
             os.unlink(p)
@@ -204,47 +191,31 @@ def _clean_stale_shm_sockets(socket_path: str, logger) -> None:
 # 子进程: 构建并运行 DeepStream pipeline
 # ============================================================================
 def _serve(config: dict):
-    # 默认收紧 GStreamer 日志，压掉 pyservicemaker/DeepStream 每次启动刷屏的
-    # "Add Element ... / LINKING: ..." 与输入源 "Opening in BLOCKING MODE"
-    # 等 INFO 噪音；nvinfer 模型加载日志走 g_print 不受影响。
-    # 需要排查管道问题时显式设置 GST_DEBUG=4 即可覆盖。
     os.environ.setdefault("GST_DEBUG", "0")
 
     log_cfg = config.get("log") or {}
     logger = setup_logger(
         name="safety_server",
         level=log_cfg.get("level", "INFO"),
-        # 部署环境用 SAFETY_LOG_FILE 覆盖（容器内映射到宿主挂载卷）
         log_file=os.environ.get("SAFETY_LOG_FILE") or log_cfg.get("file"),
     )
     logger.info("startup safety_detection_server")
 
-    # 告警规则（独立状态机 + 各自阈值）; harness/vest 的 sgie classifier-threshold
-    # 由对应规则的 attribute_threshold 重写，helmet 空间关联门限同源。
-    rules = parse_rules(config.get("rules"))
-
-    # person 检测置信度门槛（模型级，低于视为噪声）
     model = config["model"]
+    gies = parse_gies(model.get("gies"))
+    rules = parse_rules(config.get("rules"))
+    person_uid = anchor_uid(gies)
     person_conf_threshold = float(model.get("person_conf_threshold", 0.6))
 
-    pgie_config = _anchor_ini_config(Path(_resolve(_PROJECT_ROOT, model["pgie_config"])))
-    helmet_config = _anchor_ini_config(Path(_resolve(_PROJECT_ROOT, model["helmet_config"])))
-    harness_cls_config = _anchor_ini_config(
-        Path(_resolve(_PROJECT_ROOT, model["harness_cls_config"])),
-        classifier_threshold=(
-            rules[RULE_NO_HARNESS].attribute_threshold
-            if RULE_NO_HARNESS in rules else None
-        ),
-    )
-    vest_cls_config = _anchor_ini_config(
-        Path(_resolve(_PROJECT_ROOT, model["vest_cls_config"])),
-        classifier_threshold=(
-            rules[RULE_NO_VEST].attribute_threshold
-            if RULE_NO_VEST in rules else None
-        ),
-    )
+    # 每个 classifier gie 的 classifier-threshold 由引用它的规则 attribute_threshold 重写
+    gie_thresholds = {rule.gie: rule.attribute_threshold for rule in rules.values()}
 
-    # Webhook 推送器（全局共享一个）
+    # 推理链顺序：锚点 detector 最先 → 其余 detector → classifier（§3.5 约束）
+    ordered = []
+    ordered += [s for s in gies.values() if s.kind == KIND_DETECTOR and s.violation is None]
+    ordered += [s for s in gies.values() if s.kind == KIND_DETECTOR and s.violation is not None]
+    ordered += [s for s in gies.values() if s.kind == KIND_CLASSIFIER]
+
     webhook_cfg = config.get("webhook") or {}
     webhook = None
     if webhook_cfg.get("url"):
@@ -257,7 +228,6 @@ def _serve(config: dict):
     else:
         logger.warning("未配置 Webhook URL，告警不会推送")
 
-    # 每路摄像头一个 AlertManager（内部按 active_rules 拆分独立状态机）
     cameras = [c for c in config.get("cameras") or [] if c.get("enabled", True)]
     alert_managers = {}
     active_rules_by_source: dict[int, set[str]] = {}
@@ -273,17 +243,11 @@ def _serve(config: dict):
         logger.info("startup camera={} src={} webhook={} active_rules={}",
                     cam["id"], cam.get("rtsp_url"), bool(webhook), active_names)
 
-    # 异步 webhook executor（探针只做轻量决策，重活卸载到线程池）
     executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="webhook")
 
     num = len(cameras)
     out = config.get("output")
 
-    # RTSP 输入传输协议（nvurisrcbin 的 select-rtp-protocol）:
-    #   4=TCP(推荐), 1=UDP, 2=UDP-MCAST, 7=自动(UDP 优先, 失败回退 TCP)。
-    # 摄像头/防火墙不通 UDP 时，默认的 7 会让每路启动都先等 5s UDP 超时才
-    # 回退 TCP，并刷屏 "Could not receive any UDP packets ... Retrying using
-    # a tcp connection" 告警。本项目摄像头实测必须走 TCP，直接锁定 4。
     rtsp_protocol = int((config.get("source") or {}).get("rtsp_protocol", 4))
     if rtsp_protocol not in (1, 2, 4, 7):
         logger.warning("未知 source.rtsp_protocol={}，回退默认 4 (TCP)", rtsp_protocol)
@@ -295,7 +259,7 @@ def _serve(config: dict):
         "width": 1920,
         "height": 1080,
         "batched-push-timeout": 33000,
-        "live-source": 1,  # 仅支持 RTSP
+        "live-source": 1,
     })
     for i, cam in enumerate(cameras):
         p.add("nvurisrcbin", f"src{i}", {
@@ -304,17 +268,28 @@ def _serve(config: dict):
         })
         p.link((f"src{i}", "mux"), ("", "sink_%u"))  # CRITICAL: 必须用 "sink_%u"
 
-    # 第一阶段整帧检测 + 第二阶段二级分类器（裁剪 person 整框）:
-    # 顺序 pgie → helmet → harness_cls → vest_cls
-    p.add("nvinfer", "pgie", {"config-file-path": pgie_config, "batch-size": num})
-    p.add("nvinfer", "helmet", {"config-file-path": helmet_config, "batch-size": num})
-    p.add("nvinfer", "harness_cls", {"config-file-path": harness_cls_config, "batch-size": num})
-    p.add("nvinfer", "vest_cls", {"config-file-path": vest_cls_config, "batch-size": num})
+    # 推理链（对齐官方 test5：nvinfer 之间补 queue）
+    prev = "mux"
+    last_infer = None
+    for spec in ordered:
+        ini = _anchor_ini_config(
+            Path(_resolve(_PROJECT_ROOT, spec.config_path())),
+            classifier_threshold=(
+                gie_thresholds.get(spec.name) if spec.kind == KIND_CLASSIFIER else None
+            ),
+        )
+        p.add("nvinfer", spec.name, {"config-file-path": ini, "batch-size": num})
+        p.link(prev, spec.name)
+        last_infer = spec.name
+        qname = f"q-{spec.name}"
+        p.add("queue", qname, {"max-size-buffers": 4})
+        p.link(spec.name, qname)
+        prev = qname
 
-    # vest_cls 后立即拆流：之后每路独立渲染/采集/输出，彻底隔离跨流污染
     p.add("nvstreamdemux", "demux")
+    p.link(prev, "demux")
 
-    # RTSP 输出参数（单端口 + 每路不同 mount path）
+    # RTSP 输出参数
     codec = (out or {}).get("codec", "h264")
     bitrate = (out or {}).get("bitrate", 4000000)
     idrinterval = (out or {}).get("idrinterval", 30)
@@ -327,22 +302,18 @@ def _serve(config: dict):
     rtsp_mounts: dict[str, str] = {}
 
     for i, cam in enumerate(cameras):
-        # 每路独立 nvdsosd：SafetyProbe 上色（metadata 随 demux 保留到本路）
         p.add("nvdsosd", f"osd{i}", {
             "gpu-id": 0,
-            "process-mode": 1,  # GPU 模式
+            "process-mode": 1,
             "display-bbox": 1,
             "display-text": 1,
         })
-        # 证据帧 tee 分支：appsink 缓存该路已渲染帧（branch 在 frame_cache 模块建好）
         tee = add_evidence_capture(p, frame_cache, source_id=i, gpu_id=0, suffix=str(i))
         p.link((f"demux", f"osd{i}"), ("src_%u", ""))
         p.link(f"osd{i}", tee)
 
         if out:
             shm_socket = f"/tmp/vi_cam_{i}"
-            # 关键修复: 清掉上次进程残留的 shm socket，否则 shmsink 会退避成
-            # /tmp/vi_cam_0.N，与 RTSP 侧 shmsrc 的原始路径错位，预览 503。
             _clean_stale_shm_sockets(shm_socket, logger)
             p.add("nvvideoconvert", f"rtsp-conv{i}", {"gpu-id": 0, "compute-hw": 1})
             p.add("capsfilter", f"rtsp-caps{i}", {
@@ -364,22 +335,15 @@ def _serve(config: dict):
                    f"enc{i}", f"parse{i}", f"shm{i}")
             rtsp_mounts[f"{mount_prefix}/{cam['id']}"] = shm_socket
 
-    p.link("mux", "pgie", "helmet", "harness_cls", "vest_cls", "demux")
+    p.attach(last_infer, Probe("safety-probe",
+                               SafetyProbe(alert_managers, executor=executor,
+                                           frame_cache=frame_cache,
+                                           gies=gies, rules=rules,
+                                           person_uid=person_uid,
+                                           person_conf_threshold=person_conf_threshold,
+                                           active_rules_by_source=active_rules_by_source)))
+    p.attach(last_infer, "measure_fps_probe", name="fps-probe")
 
-    # no_helmet 空间关联门限 = rules.no_helmet.attribute_threshold（须 >= INI 的
-    # pre-cluster-threshold=0.25，否则低置信度框已在模型侧被裁掉）
-    helmet_conf_threshold = (
-        rules[RULE_NO_HELMET].attribute_threshold if RULE_NO_HELMET in rules else 0.5
-    )
-    p.attach("vest_cls", Probe("safety-probe",
-                                SafetyProbe(alert_managers, executor=executor,
-                                            frame_cache=frame_cache,
-                                            helmet_conf_threshold=helmet_conf_threshold,
-                                            person_conf_threshold=person_conf_threshold,
-                                            active_rules_by_source=active_rules_by_source)))
-    p.attach("vest_cls", "measure_fps_probe", name="fps-probe")
-
-    # 单端口 RTSP 输出服务：所有摄像头共用 rtsp_port，路径区分 /cam/{camera_id}
     rtsp_server = None
     if rtsp_mounts:
         rtsp_server = SinglePortRtspServer(rtsp_port, rtsp_mounts, codec=codec)
@@ -409,9 +373,8 @@ def main():
     args = parser.parse_args()
 
     print(f"加载配置: {args.config}")
-    config = load_config(args.config)  # 父进程先校验，fail fast
+    config = load_config(args.config)
 
-    # wait() 是阻塞调用，包一层子进程让 Ctrl+C 能立即生效
     proc = Process(target=_serve, args=(config,))
     try:
         proc.start()

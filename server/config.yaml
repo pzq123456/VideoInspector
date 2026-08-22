@@ -1,52 +1,65 @@
 # =============================================================================
-# 安全帽 / 反光衣检测服务端 配置文件（DeepStream 三模型整帧检测 + 二级分类器）
+# 安全帽 / 反光衣 / 安全带检测服务端 配置文件
 # =============================================================================
-# 修改此文件后重启服务即可生效，无需改动任何代码。
+# 修改此文件后:
+#   1. python tools/model_build.py --config server/config.yaml   # 编译模型产物
+#   2. python -m server.main --config server/config.yaml          # 启动服务
 #
-# 告警策略按规则（rule）独立配置，互不竞争:
-#   rules.<rule>.cooldown_seconds    触发后冷却时长（秒）
-#   rules.<rule>.min_detection_count 连续违规帧数阈值（防单帧误报）
-#   rules.<rule>.attribute_threshold 违规置信度门限（同时作为 helmet 空间关联门限）
-#   每路摄像头用 active_rules 声明跟踪哪些规则，只计算/判定激活的维度。
+# model.gies 是模型拓扑的单一事实来源，每项声明:
+#   kind      detector(整帧检测) | classifier(二级分类，作用于 person 裁剪框)
+#   source    模型来源 .pt（编译入口）
+#   uid       gie-unique-id（全局唯一）
+#   violation 报警类标签（只写报警类，如 head/no_vest/no_harness；锚点无此字段）
+#             classifier 若 violation 不在 index0，构建工具自动交换输出通道使其落到 class0
+# rules 每条独立状态机（冷却 / 连续帧确认 / 违规置信度门限），gie 引用上面的模型名。
 # =============================================================================
 
-# -----------------------------------------------------------------------------
-# 模型参数（两阶段 DeepStream 推理）
-#   第一阶段·整帧检测（primary GIE）:
-#     pgie   → 人体检测（yolo26n, person 类, uid=1）
-#     helmet → 安全帽整帧检测（head/helmet, uid=3）
-#   第二阶段·二级分类器（secondary GIE, process-mode=2, 裁剪 person 整框）:
-#     harness_cls → 安全带 2 类分类器（uid=5）
-#     vest_cls    → 反光衣 2 类分类器（uid=6）
-# 配置为 INI 文本（路径可相对项目根目录解析），INI 内部引用的模型路径同样
-# 相对根目录，启动时由 server/main.py 统一锚定为绝对路径（开发容器 /
-# 生产镜像 /app 通用）。引擎/parser 复用根目录 models/ 已有产物。
-# -----------------------------------------------------------------------------
 model:
-  pgie_config: "configs/pgie_config_person.txt"       # 人体检测（整帧, uid=1）
-  helmet_config: "configs/pgie_config_helmet.txt"     # 安全帽（整帧, uid=3）
-  harness_cls_config: "configs/sgie_config_harness_cls.txt"  # 安全带分类器（二级, uid=5）
-  vest_cls_config: "configs/sgie_config_vest_cls.txt"        # 反光衣分类器（二级, uid=6）
-  person_conf_threshold: 0.6     # person 检测置信度门槛，低于此视为噪声（不判定、不渲染、不告警）
+  person_conf_threshold: 0.6     # person 检测置信度门槛，低于视为噪声（不判定、不渲染、不告警）
+  gies:
+    person:                                    # 锚点检测器（不告警）
+      kind: detector
+      source: models/person/yolo26n.pt
+      uid: 1
+
+    helmet:                                    # 安全帽整帧检测
+      kind: detector
+      source: models/helmet/best.pt
+      uid: 3
+      violation: head                          # head = 未戴帽（报警类）
+
+    harness_cls:                               # 安全带二级分类器
+      kind: classifier
+      source: models/original/harness/yolo26m_cls_harness_20260817_0547/weights/best.pt
+      uid: 5
+      violation: no_harness                    # 原 index1 → 构建期自动换到 class0
+
+    vest_cls:                                  # 反光衣二级分类器（新模型，修复 §6 预处理脆弱）
+      kind: classifier
+      source: models/original/vest/yolo26mcls_ppeVest_20260820_0923/weights/best.pt
+      uid: 6
+      violation: no_vest                       # 原 index0，无需交换
 
 # -----------------------------------------------------------------------------
-# 告警规则（每条规则独立状态机: 冷却 / 连续帧确认 / 违规置信度门限）
+# 告警规则（每条规则独立状态机；gie 引用 model.gies 的名称）
+#   classifier 的 classifier-threshold 由 attribute_threshold 启动时重写进 INI；
+#   detector 的 attribute_threshold 同时作为空间关联门限。
 # -----------------------------------------------------------------------------
-# harness/vest 二级分类器的 classifier-threshold 由对应规则的
-# attribute_threshold 启动时重写进 sgie INI；no_helmet 的
-# attribute_threshold 同时作为 helmet 框匹配 person 的空间关联门限。
 rules:
   no_helmet:
+    gie: helmet
     cooldown_seconds: 10
     min_detection_count: 3
     attribute_threshold: 0.5
 
   no_vest:
-    cooldown_seconds: 15
-    min_detection_count: 5
-    attribute_threshold: 0.5
+    gie: vest_cls
+    cooldown_seconds: 30
+    min_detection_count: 10
+    attribute_threshold: 0.7
 
   no_harness:
+    gie: harness_cls
     cooldown_seconds: 5
     min_detection_count: 2
     attribute_threshold: 0.5
@@ -87,7 +100,7 @@ cameras:
     name: "Mobile Camera 0671"
     rtsp_url: "rtsp://118.140.234.166:8554/dahua1000330"
     enabled: true
-    active_rules: ["no_helmet"]
+    active_rules: ["no_helmet", "no_vest", "no_harness"]
 
   - id: "676"
     name: "Mobile Camera 0676"
@@ -99,35 +112,29 @@ cameras:
     name: "Mobile Camera 0891"
     rtsp_url: "rtsp://118.140.234.166:8554/dahua1000352"
     enabled: true
-    active_rules: ["no_helmet", "no_vest"]
+    active_rules: ["no_helmet", "no_vest", "no_harness"]
 
 # -----------------------------------------------------------------------------
 # RTSP 输入
 # -----------------------------------------------------------------------------
 # rtsp_protocol: 输入传输协议（nvurisrcbin select-rtp-protocol）
-#   4 = TCP（推荐: 摄像头/防火墙不通 UDP 时无需等 5s 超时回退，无告警刷屏）
-#   1 = UDP | 2 = UDP-MCAST | 7 = 自动（UDP 优先，失败回退 TCP）
+#   4 = TCP（推荐） | 1 = UDP | 2 = UDP-MCAST | 7 = 自动
 source:
   rtsp_protocol: 4
 
 # -----------------------------------------------------------------------------
-# RTSP 输出（替代原 MJPEG 预览；注释掉 output 节即关闭）
+# RTSP 输出（注释掉 output 节即关闭）
 # -----------------------------------------------------------------------------
-# 单端口 RTSP 服务：所有摄像头共用 rtsp_port，通过挂载点路径区分。
-#   播放地址（示例）:
-#     rtsp://localhost:8554/cam/1363
-#     rtsp://localhost:8554/cam/1384
-#     ... 依此类推（camera_id 与 cameras 列表一一对应）
 output:
-  rtsp_port: 8554            # 单一 RTSP 服务端口（所有摄像头共用）
-  mount_prefix: /cam         # 挂载点前缀，每路 = /cam/<camera_id>
-  codec: h264                # 输出编码: h264 / h265
-  bitrate: 4000000           # 编码码率 (bps)
-  idrinterval: 30            # 关键帧间隔（帧）
+  rtsp_port: 8554
+  mount_prefix: /cam
+  codec: h264
+  bitrate: 4000000
+  idrinterval: 30
 
 # -----------------------------------------------------------------------------
 # 日志参数
 # -----------------------------------------------------------------------------
 log:
-  level: "INFO"                # DEBUG / INFO / WARNING / ERROR
-  file: "logs/server.log"      # 日志文件路径（JSON 格式，自动轮转 10MB，保留 30 天）
+  level: "INFO"
+  file: "logs/server.log"

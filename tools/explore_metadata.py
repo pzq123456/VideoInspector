@@ -212,7 +212,7 @@ def main():
                          "转储二级分类器元数据 (classifier_items/get_n_label)")
     args = ap.parse_args()
 
-    pgie = _anchor(os.path.join(ROOT, "configs", "pgie_config_person.txt"))
+    pgie = _anchor(os.path.join(ROOT, "generated", "person", "pgie_config.txt"))
     uri = "file://" + os.path.abspath(args.file)
 
     p = Pipeline("explore-metadata")
@@ -222,11 +222,11 @@ def main():
     p.add("nvinfer", "pgie", {"config-file-path": pgie})
     tail = "pgie"
     if args.full:
-        for name, cfg in (("helmet", "pgie_config_helmet.txt"),
-                          ("harness_cls", "sgie_config_harness_cls.txt"),
-                          ("vest_cls", "sgie_config_vest_cls.txt")):
+        for name in ("helmet", "harness_cls", "vest_cls"):
+            prefix = "sgie" if name.endswith("_cls") else "pgie"
+            cfg = f"generated/{name}/{prefix}_config.txt"
             p.add("nvinfer", name,
-                  {"config-file-path": _anchor(os.path.join(ROOT, "configs", cfg))})
+                  {"config-file-path": _anchor(os.path.join(ROOT, cfg))})
             tail = name
     p.add("fakesink", "sink")
     p.link(("src", "mux"), ("", "sink_%u"))

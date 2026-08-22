@@ -1,43 +1,20 @@
 """
-DeepStream 探针 → 告警状态机桥
+DeepStream 探针 → 告警状态机桥（配置驱动）
 
-把两阶段检测（person/helmet 整帧 + harness/vest 二级分类器）的 batch
-元数据翻译成 server.metadata.ObjectMeta 列表，按 source_id 喂给对应的
-AlertManager；同时给底层对象上色（nvdsosd 原生渲染，证据帧与实时预览
-共享同一渲染源）。
+把两阶段检测（person 锚点整帧检测 + detector 整帧 + classifier 二级分类）的 batch
+元数据翻译成 server.metadata.ObjectMeta 列表，按 source_id 喂给对应的 AlertManager；
+同时给对象上色（nvdsosd 原生渲染，证据帧与实时预览共享同一渲染源）。
 
-按「规则」解耦：每路摄像头通过 active_rules 声明跟踪哪些规则，探针只计算
-激活维度的违规属性，其余维度跳过（省算力）；渲染判定（红/绿/蓝）也按
-「本路激活规则」而非全局三条。
+模型拓扑来自 config（model.gies + rules），探针不再硬编码任何 uid/规则名：
+  - detector（如 helmet）：整帧检测器，空间关联（检测框中心落在 person 框内且
+    label == violation）→ 违规
+  - classifier（如 harness/vest）：读 person 对象上的 NvDsClassifierMeta，label == violation → 违规
+  - 违规翻译为 AttributeMeta(rule_name)，rule_name 即 alert_type。
 
-流程（空间关联逻辑源自 simple-demo3/two_stage_demo.py 已验证方案）:
-  - 整帧检测（process-mode=1，结果按 gie-unique-id 挂在帧级）:
-      uid=1  person（yolo26n, 只出 person）
-      uid=3  helmet（head/helmet）
-  - 二级分类器（作用于 person 整框，结果以 NvDsClassifierMeta 挂在 person 对象）:
-      uid=5  harness（harness/no_harness）
-      uid=6  vest（vest/no_vest）
-  - 第一趟: 收集 helmet 框的普通数值（class_id/conf/中心点），
-    不持有元数据包装器（跨 pass 持有会段错误），同时给这些框上色。
-  - 第二趟: 每个 person 对激活维度判定:
-      no_helmet → helmet 空间关联（检测框中心落在 person 框内，
-                  attribute_threshold 同时作为关联门限）,
-      no_harness / no_vest → 读取对应二级分类器结果,
-    违规翻译为 AttributeMeta('no_helmet') / AttributeMeta('no_harness') /
-    AttributeMeta('no_vest')，并按状态给 person 框上色
-    （红=任一激活违规 / 绿=激活维度全达标 / 蓝=有激活维度未知），
-    违规者叠加文本标签（nvdsosd 的 per-object text_params）。
-
-渲染约定（证据帧 = 完整 OSD 渲染帧，与实时预览一致）:
-  - 任一激活规则违规的人 → 红色框 + 违规标签
-  - 激活规则全达标（如 helmet 且 vest）→ 绿色框
-  - 任一激活维度未知                               → 蓝色框
-  - head/helmet 框                → 红=head(未戴), 绿=helmet(已戴)
-
-约束:
-  - 本探针在 GStreamer 流线程运行，只做轻量决策；
-    JPEG / base64 / HTTP 由 AlertManager 内部 executor + daemon 线程处理。
-  - 上色必须在同一 pass 内完成（不能把元数据包装器存到 list 跨 pass 复用）。
+约束（与旧版一致）:
+  - 本探针在 GStreamer 流线程运行，只做轻量决策；JPEG/base64/HTTP 由 AlertManager
+    内部 executor + daemon 线程处理。
+  - 上色必须在同一 pass 内完成（object_items 是一次性迭代器，不能跨 pass 持有包装器）。
 """
 
 from __future__ import annotations
@@ -49,138 +26,118 @@ from pyservicemaker import BatchMetadataOperator, osd
 from loguru import logger
 
 from server.metadata import AttributeMeta, ObjectMeta
+from server.model_spec import KIND_CLASSIFIER, KIND_DETECTOR
+from server.alert.rules import RuleConfig
 
-RED = osd.Color(1.0, 0.0, 0.0, 1.0)    # 违规（no_helmet / no_harness / no_vest）
-GREEN = osd.Color(0.0, 1.0, 0.0, 1.0)  # 激活规则全达标
-BLUE = osd.Color(0.0, 0.0, 1.0, 1.0)   # 有激活维度未知
+RED = osd.Color(1.0, 0.0, 0.0, 1.0)    # 违规
+GREEN = osd.Color(0.0, 1.0, 0.0, 1.0)  # detector 框：合规类
+BLUE = osd.Color(0.0, 0.0, 1.0, 1.0)   # person：无违规
 
-PERSON_UID = 1      # pgie (yolo26n)
-HELMET_UID = 3                # helmet 整帧检测器
-HARNESS_CLS_UID = 5   # harness 二级分类器（作用于 person）
-VEST_CLS_UID = 6      # vest 二级分类器（作用于 person）
-
-# 规则名（与 config.yaml rules 节一一对应，同时作为告警 AttributeMeta.name）
-RULE_NO_HELMET = "no_helmet"
-RULE_NO_HARNESS = "no_harness"
-RULE_NO_VEST = "no_vest"
-
-# helmet 框的类别 id 对应模型 labels.txt 的行序
-HELMET_CLASS_ID = 1   # helmet: 0=head(未戴), 1=helmet(已戴)
-HEAD_CLASS_ID = 0
-
-HARNESS_OK_LABELS = {"harness"}
-HARNESS_VIOLATION_LABELS = {"no_harness"}
-VEST_OK_LABELS = {"vest"}
-VEST_VIOLATION_LABELS = {"no_vest"}
-CLASSIFIER_LABELS = HARNESS_OK_LABELS | HARNESS_VIOLATION_LABELS | VEST_OK_LABELS | VEST_VIOLATION_LABELS
-# 分类器置信度解析失败时的回退值（用于 payload 展示，判定由规则阈值负责）
+# 分类器置信度解析失败时的回退值（payload 展示用，判定由 classifier-threshold 负责）
 CLASSIFIER_FALLBACK_CONF = 0.5
 
 
 class SafetyProbe(BatchMetadataOperator):
-    """逐帧: 按激活规则计算 → ObjectMeta 列表 → 对应摄像头的 AlertManager.handle()。
+    """逐帧: 按激活规则计算违规 → ObjectMeta 列表 → 对应摄像头的 AlertManager.handle()。
 
     Args:
         alert_managers: {source_id(int): AlertManager}，每路摄像头一个状态机。
         executor: ThreadPoolExecutor，透传给 AlertManager 用于异步 webhook。
         frame_cache: 可选 FrameCache，触发告警时取该 source 最新已渲染帧作 snapshot。
-        helmet_conf_threshold: no_helmet 规则的空间关联门限（= rules.no_helmet.
-            attribute_threshold，低于视为噪声）。
-        person_conf_threshold: person 检测置信度门槛（低于视为噪声：不判定、不渲染、不告警）。
-        active_rules_by_source: {source_id: {规则名}}，每路摄像头激活的规则；
-            未列出的 source 默认全部规则（保持向后兼容）。
+        gies: {gie_name: GieSpec}，模型拓扑（来自 config）。
+        rules: {rule_name: RuleConfig}，告警规则（gie 引用 gies）。
+        person_uid: 锚点检测器（person）的 uid。
+        person_conf_threshold: person 置信度门槛（低于视为噪声）。
+        active_rules_by_source: {source_id: {rule_name}}，每路摄像头激活的规则。
     """
 
     def __init__(self, alert_managers: dict,
                  executor: ThreadPoolExecutor | None = None,
                  frame_cache=None,
-                 helmet_conf_threshold: float = 0.5,
-                 person_conf_threshold: float = 0.4,
+                 gies: dict | None = None,
+                 rules: dict[str, RuleConfig] | None = None,
+                 person_uid: int = 1,
+                 person_conf_threshold: float = 0.6,
                  active_rules_by_source: dict[int, set[str]] | None = None):
         super().__init__()
         self._managers = alert_managers
         self._executor = executor
-        # 证据帧缓存（FrameCache）: 触发告警时取该 source 最新已渲染帧作 snapshot。
-        # None 表示未启用证据帧采集，行为与之前一致（frame_base64=null）。
         self._frame_cache = frame_cache
-        # 空间关联置信度门槛（来自 config.yaml rules.no_helmet.attribute_threshold，
-        # 须 >= INI 的 pre-cluster-threshold，否则低置信度框已在模型侧被裁掉）
-        self._helmet_conf_threshold = helmet_conf_threshold
-        # person 检测置信度门槛（低于视为噪声：不参与关联/判定/渲染/告警）
+        self._gies = gies or {}
+        self._rules = rules or {}
+        self._person_uid = person_uid
         self._person_conf_threshold = person_conf_threshold
-        # 每路摄像头激活的规则（只计算/判定/渲染这些维度）
         self._active_rules_by_source = active_rules_by_source or {}
+        self._all_rules = set(self._rules)
+
+        # 预解析: rule → gie 规格（uid / kind / violation）
+        # detector 与 classifier 分桶，热路径免查 kind。
+        self._rule_binding: dict[str, tuple] = {}   # rule_name -> (uid, kind, violation)
+        self._known_labels: set[str] = set()
+        for rule_name, rule in self._rules.items():
+            spec = self._gies[rule.gie]
+            self._rule_binding[rule_name] = (spec.uid, spec.kind, spec.violation)
+            if spec.violation:
+                self._known_labels.add(spec.violation)
 
     def handle_metadata(self, batch_meta):
         for frame_meta in batch_meta.frame_items:
             source_id = frame_meta.source_id
-            active = self._active_rules_by_source.get(source_id, _ALL_RULES)
+            active = self._active_rules_by_source.get(source_id, self._all_rules)
 
-            # 第一趟: 收集 helmet 检测框的普通数值，避免持有元数据包装器；
-            # 同时给这些框上色（nvdsosd 原生渲染，与证据帧/预览共享）
-            helmet_boxes = []  # [(class_id, conf, cx, cy)]
-            if RULE_NO_HELMET in active:
+            active_detector_uids: set[int] = set()
+            for rule_name in active:
+                uid, kind, _ = self._rule_binding[rule_name]
+                if kind == KIND_DETECTOR:
+                    active_detector_uids.add(uid)
+
+            # 第一趟: 收集 detector 检测框的普通数值（label/conf/中心点），不持有包装器；
+            # 同时给这些框上色（violation=红，其余=绿）。
+            detector_boxes: dict[int, list] = {}
+            for uid in active_detector_uids:
+                boxes = []
                 for o in frame_meta.object_items:  # 一次性迭代器
-                    if o.unique_component_id == HELMET_UID:
-                        o.rect_params.border_color = (
-                            GREEN if o.class_id == HELMET_CLASS_ID else RED
-                        )
-                        helmet_boxes.append(self._box_vals(o))
+                    if o.unique_component_id == uid:
+                        violation = self._uid_violation(uid)
+                        label = getattr(o, "label", "")
+                        o.rect_params.border_color = RED if label == violation else GREEN
+                        boxes.append((
+                            label,
+                            o.confidence,
+                            o.rect_params.left + o.rect_params.width / 2,
+                            o.rect_params.top + o.rect_params.height / 2,
+                        ))
+                detector_boxes[uid] = boxes
 
-            # 第二趟: 每个 person → ObjectMeta（激活维度违规进 attributes）+ 状态上色
+            # 第二趟: 每个 person → ObjectMeta（违规进 attributes）+ 状态上色
             objects: list[ObjectMeta] = []
             for obj in frame_meta.object_items:
-                if obj.unique_component_id != PERSON_UID:
+                if obj.unique_component_id != self._person_uid:
                     continue
                 if obj.confidence < self._person_conf_threshold:
                     continue
 
                 attrs: list[AttributeMeta] = []
-                statuses: list[str | None] = []  # 激活维度各自状态: "ok"/"violation"/None
+                for rule_name in active:
+                    rule = self._rules[rule_name]
+                    uid, kind, violation = self._rule_binding[rule_name]
+                    if kind == KIND_DETECTOR:
+                        conf = self._match_violation(
+                            obj, detector_boxes.get(uid, []),
+                            violation, rule.attribute_threshold,
+                        )
+                        if conf is not None:
+                            attrs.append(AttributeMeta(rule_name, conf))
+                    else:  # classifier
+                        label = self._classifier_label(obj.classifier_items, uid)
+                        if label == violation:
+                            attrs.append(AttributeMeta(rule_name, CLASSIFIER_FALLBACK_CONF))
 
-                if RULE_NO_HELMET in active:
-                    matched = self._matched_conf(
-                        obj, helmet_boxes, self._helmet_conf_threshold
-                    )
-                    h_status, h_attr, h_conf = self._helmet_status(matched)
-                    if h_attr:
-                        attrs.append(AttributeMeta(h_attr, h_conf))
-                    statuses.append(h_status)
-
-                if RULE_NO_HARNESS in active:
-                    har_status, har_label, har_conf = self._classifier_status(
-                        obj.classifier_items, HARNESS_CLS_UID,
-                        HARNESS_OK_LABELS, HARNESS_VIOLATION_LABELS,
-                    )
-                    if har_status == "violation":
-                        attrs.append(AttributeMeta(
-                            har_label,
-                            har_conf if har_conf is not None else CLASSIFIER_FALLBACK_CONF,
-                        ))
-                    statuses.append(har_status)
-
-                if RULE_NO_VEST in active:
-                    vest_status, vest_label, vest_conf = self._classifier_status(
-                        obj.classifier_items, VEST_CLS_UID,
-                        VEST_OK_LABELS, VEST_VIOLATION_LABELS,
-                    )
-                    if vest_status == "violation":
-                        attrs.append(AttributeMeta(
-                            vest_label,
-                            vest_conf if vest_conf is not None else CLASSIFIER_FALLBACK_CONF,
-                        ))
-                    statuses.append(vest_status)
-
-                # 任一激活违规=红；激活维度全达标=绿；有激活维度未知=蓝
-                violation = any(s == "violation" for s in statuses)
-                obj.rect_params.border_width = 2
-                if violation:
+                # 有违规=红；无违规=蓝（classifier 合规类不可观测，无绿框）
+                if attrs:
+                    obj.rect_params.border_width = 2
                     obj.rect_params.border_color = RED
-                    self._set_osd_label(
-                        obj, " ".join(a.name for a in attrs)
-                    )
-                elif statuses and all(s == "ok" for s in statuses):
-                    obj.rect_params.border_color = GREEN
+                    self._set_osd_label(obj, " ".join(a.name for a in attrs))
                 else:
                     obj.rect_params.border_color = BLUE
 
@@ -198,32 +155,44 @@ class SafetyProbe(BatchMetadataOperator):
 
             manager = self._managers.get(source_id)
             if manager is not None:
-                # 快照只取缓存引用（不拷贝），仅在真正触发告警时才被读取/编码
                 snapshot = (
                     self._frame_cache.latest(source_id)
                     if self._frame_cache else None
                 )
                 manager.handle(objects, snapshot=snapshot, executor=self._executor)
             elif objects:
-                logger.debug("source_id={} 无对应 AlertManager，跳过告警判定",
-                             source_id)
+                logger.debug("source_id={} 无对应 AlertManager，跳过告警判定", source_id)
 
     # ------------------------------------------------------------------
-    # 静态工具：与 simple-demo3 的 SafetyMarker 同源
+    # 内部: 预解析辅助
+    # ------------------------------------------------------------------
+    def _uid_violation(self, uid: int) -> str | None:
+        for rule_name, (u, kind, violation) in self._rule_binding.items():
+            if u == uid and kind == KIND_DETECTOR:
+                return violation
+        return None
+
+    # ------------------------------------------------------------------
+    # 静态工具
     # ------------------------------------------------------------------
     @staticmethod
-    def _box_vals(o):
-        """提取检测框的普通数值（class_id/confidence/中心点），不持有元数据包装器。"""
-        return (
-            o.class_id,
-            o.confidence,
-            o.rect_params.left + o.rect_params.width / 2,
-            o.rect_params.top + o.rect_params.height / 2,
-        )
+    def _match_violation(obj, boxes, violation_label, conf_threshold):
+        """中心点落在 person 框内、label==violation、置信度达标的框 → 最高置信度（无则 None）。"""
+        px1 = obj.rect_params.left
+        py1 = obj.rect_params.top
+        px2 = px1 + obj.rect_params.width
+        py2 = py1 + obj.rect_params.height
+        best = None
+        for label, conf, cx, cy in boxes:
+            if label != violation_label or conf < conf_threshold:
+                continue
+            if px1 <= cx <= px2 and py1 <= cy <= py2:
+                if best is None or conf > best:
+                    best = conf
+        return best
 
     @staticmethod
     def _set_osd_label(o, text: str):
-        """在 person 框上方叠加违规文本标签（nvdsosd per-object text_params）。"""
         if not text:
             return
         o.text_params.display_text = text.encode("ascii")
@@ -233,88 +202,43 @@ class SafetyProbe(BatchMetadataOperator):
         o.text_params.font_params.size = 12
         o.text_params.font_params.color = RED
 
-    @staticmethod
-    def _matched_conf(obj, boxes, conf_threshold):
-        """中心点落在 obj 框内、且置信度达标的 box → {class_id: best_conf}。"""
-        px1 = obj.rect_params.left
-        py1 = obj.rect_params.top
-        px2 = px1 + obj.rect_params.width
-        py2 = py1 + obj.rect_params.height
-        matched = {}
-        for cls_id, conf, cx, cy in boxes:
-            if conf < conf_threshold:
-                continue
-            if px1 <= cx <= px2 and py1 <= cy <= py2:
-                if conf > matched.get(cls_id, 0.0):
-                    matched[cls_id] = conf
-        return matched
-
-    @classmethod
-    def _helmet_status(cls, matched):
-        """戴帽状态; helmet 优先（同时命中 head 与 helmet 时按已戴帽处理）。
-
-        Returns:
-            (status, attr_name, conf): status ∈ {"ok", "violation", None}，
-            attr_name 仅违规时为 RULE_NO_HELMET，否则 None。
-        """
-        if HELMET_CLASS_ID in matched:
-            return "ok", None, matched[HELMET_CLASS_ID]
-        if HEAD_CLASS_ID in matched:
-            return "violation", RULE_NO_HELMET, matched[HEAD_CLASS_ID]
-        return None, None, None
-
     # 每个 uid 只 DEBUG 一次 get_n_label 原始格式（避免热路径逐人逐帧刷屏）
     _logged_label_formats: set[int] = set()
 
     @classmethod
-    def _classifier_status(cls, classifier_items, uid, ok_labels, violation_labels):
-        """读 person 对象的二级分类器结果 → (status, label, conf)。
-
-        status: "ok" / "violation" / None（无结果或未命中）
-        classifier_items 为 ObjectMetadata.classifier_items（可迭代），
-        每个元素有 unique_component_id / n_labels / get_n_label(i)->str。
-        """
-        status = label = conf = None
+    def _classifier_label(cls, classifier_items, uid: int) -> str | None:
+        """读 person 对象的二级分类器结果 → 首个挂载的 label 名（class0，即违规类）。"""
         try:
             for clf in classifier_items:
                 if getattr(clf, "unique_component_id", None) != uid:
                     continue
                 for i in range(getattr(clf, "n_labels", 0)):
                     raw = clf.get_n_label(i)
-                    parsed_label, parsed_conf = cls._parse_classifier_label(raw)
+                    label, _conf = cls._parse_classifier_label(raw)
                     if uid not in cls._logged_label_formats:
                         cls._logged_label_formats.add(uid)
-                        logger.debug("classifier uid={} raw={!r} parsed=({}, {})", uid, raw, parsed_label, parsed_conf)
-                    if parsed_label in violation_labels:
-                        return "violation", parsed_label, parsed_conf
-                    if status is None and parsed_label in ok_labels:
-                        status, label, conf = "ok", parsed_label, parsed_conf
+                        logger.debug("classifier uid={} raw={!r} parsed={}", uid, raw, label)
+                    return label
         except Exception:
             logger.exception("读取分类器结果异常")
-        return status, label, conf
+        return None
 
     @staticmethod
     def _parse_classifier_label(raw: str):
-        """防御性解析 get_n_label 字符串 → (label_name | None, confidence | None)。
-
-        格式未知，可能为纯 label（"vest"）或带置信度（"vest:0.98" / "vest 0.98"）。
-        用已知类名集合匹配 label token；数值 token 当作置信度。
-        """
+        """防御性解析 get_n_label 字符串 → (label_name | None, confidence | None)。"""
         if not raw:
             return None, None
         tokens = re.split(r"[: \t]+", raw.strip())
-        label = None
-        for t in tokens:
-            if t in CLASSIFIER_LABELS:
-                label = t
-                break
         conf = None
         for t in tokens:
             try:
                 conf = float(t)
             except ValueError:
                 pass
-        return label, conf
-
-
-_ALL_RULES = {RULE_NO_HELMET, RULE_NO_VEST, RULE_NO_HARNESS}
+        # label 取第一个非数值 token（get_n_label 只挂 class0，即违规类）
+        for t in tokens:
+            try:
+                float(t)
+            except ValueError:
+                return t, conf
+        return None, conf
