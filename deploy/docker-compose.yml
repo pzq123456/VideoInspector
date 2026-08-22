@@ -3,6 +3,8 @@
 # 使用: cd deploy && docker compose up -d --build
 #   - 首次启动自动增量构建引擎（分钟级），之后重启秒级跳过
 #   - 换模型 = 替换 models/ 下 .pt → 重启容器即自动重建加载
+#   - 浸泡测试（可选）: docker compose --profile soak up -d
+#     额外启动告警接收端，JSONL+证据帧落 ./alerts/，次日复盘
 # =============================================================================
 services:
   detector:
@@ -15,9 +17,6 @@ services:
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
-      # webhook 若跑在宿主机: 把 config.yaml 的 url 改为
-      #   http://host.docker.internal:9999/api/ppe-alert  （extra_hosts 已放通）
-      # 或改用 network_mode: host，保持 localhost 不变（端口映射随之失效）
     shm_size: "1g"
 
     volumes:
@@ -27,10 +26,24 @@ services:
       - ./logs:/app/deploy/logs
 
     ports:
-      - "18003:8554/tcp"                # config output.rtsp_port=8554 → 宿主沿用旧端口契约
-      - "18004-18020:18004-18020/udp"   # RTSP UDP 传输段
+      - "18003:8554/tcp"
 
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # 告警接收端（可选，浸泡测试专用）: docker compose --profile soak up -d
+  #   复用 detector 镜像零额外构建；不发布端口，仅 compose 内网可达。
+  #   产物落宿主机 ./alerts/: payload.jsonl（告警记录）+ <camera_id>/*.jpg（证据帧）
+  # ---------------------------------------------------------------------------
+  alert-receiver:
+    image: safety-detector:latest
+    container_name: alert-receiver
+    profiles: ["soak"]
+    command: python3 /app/receiver.py --port 9999 --save-dir /app/alerts
+    volumes:
+      - ../local/webhook_receiver.py:/app/receiver.py:ro
+      - ./alerts:/app/alerts
     restart: unless-stopped
