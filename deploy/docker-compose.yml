@@ -6,12 +6,22 @@ services:
     image: safety-detector:latest
     pull_policy: build
     container_name: safety-detector
-    runtime: nvidia
     privileged: true
+    ipc: host                  # 对齐开发容器的共享内存机制（NVMM 跨进程内存）
+    shm_size: "2g"
+
+    # ===== 复刻 DevContainer 底层 `--gpus all` 的 CDI 挂载机制 =====
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, video, compute, utility]
+
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
-      - NVIDIA_DRIVER_CAPABILITIES=compute,utility,video,display  
-    shm_size: "1g"
+      - NVIDIA_DRIVER_CAPABILITIES=all   # 开放包括 decoder/encoder 在内的全量能力
 
     volumes:
       - ./config.yaml:/app/deploy/config.yaml:ro
@@ -31,7 +41,7 @@ services:
     restart: unless-stopped
 
   alert-receiver:
-    image: python:3.11-slim          # 轻量接收端：python + loguru 足矣，勿复用主推理镜像
+    image: python:3.11-slim
     container_name: alert-receiver
     profiles: ["soak"]
     working_dir: /app
