@@ -30,10 +30,16 @@ class GieSpec:
     source: str                     # 模型来源 .pt/.onnx（编译入口，相对部署根 = config 所在目录）
     uid: int                        # gie-unique-id，全局唯一
     violation: str | None = None    # 报警类标签（classifier 必填；detector 报警模型必填）
+    attach: str | None = None       # 二级 detector 附属的锚点 gie 名（如 person）；空 = 整帧
+
+    @property
+    def is_secondary(self) -> bool:
+        """二级模型（附属在锚点检出框上推理）：classifier 恒真，detector 看 attach。"""
+        return self.kind == KIND_CLASSIFIER or self.attach is not None
 
     def config_path(self) -> str:
         """生成的 nvinfer INI 路径（generated/<name>/ 下）。"""
-        prefix = "sgie_config" if self.kind == KIND_CLASSIFIER else "pgie_config"
+        prefix = "sgie_config" if self.is_secondary else "pgie_config"
         return f"generated/{self.name}/{prefix}.txt"
 
 
@@ -66,6 +72,14 @@ def parse_gies(raw: dict | None) -> dict[str, GieSpec]:
             raise ValueError(f"model.gies.{name} 是 classifier，必须声明 violation（报警类）")
         if violation is not None and not isinstance(violation, str):
             raise ValueError(f"model.gies.{name}.violation 必须是字符串，当前: {violation!r}")
+        attach = cfg.get("attach")
+        if attach is not None:
+            if kind != KIND_DETECTOR:
+                raise ValueError(f"model.gies.{name}.attach 仅 detector 支持（classifier 天然二级），当前 kind={kind!r}")
+            if not violation:
+                raise ValueError(f"model.gies.{name} 声明了 attach（二级检测器），必须同时声明 violation（报警类）")
+            if not isinstance(attach, str) or not attach:
+                raise ValueError(f"model.gies.{name}.attach 必须是非空字符串（锚点 gie 名），当前: {attach!r}")
 
         seen_uids[uid] = name
         gies[name] = GieSpec(
@@ -74,7 +88,21 @@ def parse_gies(raw: dict | None) -> dict[str, GieSpec]:
             source=source,
             uid=uid,
             violation=violation,
+            attach=attach,
         )
+
+    # 第二遍校验 attach 引用（锚点可能声明在后面，须全量解析后再查）
+    for spec in gies.values():
+        if spec.attach is None:
+            continue
+        target = gies.get(spec.attach)
+        if target is None:
+            raise ValueError(f"model.gies.{spec.name}.attach={spec.attach!r} 引用了未定义的 gie")
+        if target.kind != KIND_DETECTOR or target.violation is not None:
+            raise ValueError(
+                f"model.gies.{spec.name}.attach={spec.attach!r} 必须指向锚点检测器"
+                f"（kind=detector 且无 violation），当前 kind={target.kind}, violation={target.violation!r}"
+            )
     return gies
 
 

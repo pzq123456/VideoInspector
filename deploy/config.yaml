@@ -8,9 +8,11 @@
 #
 # model.gies 是模型拓扑的单一事实来源，每项声明:
 #   kind      detector(整帧检测) | classifier(二级分类，作用于 person 裁剪框)
+#   attach    二级检测器专用：附属的锚点 gie 名（如 person），声明后该 detector
+#             以 process-mode=2 在锚点检出框上推理（如抽烟检测）；空 = 整帧
 #   source    模型来源 .pt（编译入口，相对本文件所在目录）
 #   uid       gie-unique-id（全局唯一）
-#   violation 报警类标签（只写报警类，如 head/no_vest/no_harness；锚点无此字段）
+#   violation 报警类标签（只写报警类，如 head/no_vest/no_harness/cigarette；锚点无此字段）
 #             classifier 若 violation 不在 index0，构建工具自动交换输出通道使其落到 class0
 # rules 每条独立状态机（冷却 / 连续帧确认 / 违规置信度门限），gie 引用上面的模型名。
 # =============================================================================
@@ -41,6 +43,13 @@ model:
       uid: 6
       violation: no_vest                       # 原 index0，无需交换
 
+    smoke:                                     # 抽烟二级检测器（附属在 person 裁剪框上检测）
+      kind: detector
+      attach: person                           # 二级：裁剪锚点(person)检出框送检
+      source: models/smoke/yolo26m_smoking_20260707_0224/weights/best.pt
+      uid: 7
+      violation: cigarette                     # 单类模型，cigarette 即报警类
+
 # -----------------------------------------------------------------------------
 # 告警规则（每条规则独立状态机；gie 引用 model.gies 的名称）
 #   classifier 的 classifier-threshold 由 attribute_threshold 启动时重写进 INI；
@@ -64,6 +73,12 @@ rules:
     cooldown_seconds: 30
     min_detection_count: 5
     attribute_threshold: 0.7
+
+  smoking:
+    gie: smoke
+    cooldown_seconds: 30
+    min_detection_count: 5
+    attribute_threshold: 0.5
 
 # -----------------------------------------------------------------------------
 # Webhook 告警推送（alert_type 为触发的规则名，如 "no_vest"）
@@ -102,7 +117,7 @@ cameras:
     name: "Mobile Camera 0671"
     rtsp_url: "rtsp://118.140.234.166:8554/dahua1000330"
     enabled: true
-    active_rules: ["no_helmet", "no_vest", "no_harness"]
+    active_rules: ["no_helmet", "no_vest", "no_harness", "smoking"]
 
   - id: "676"
     name: "Mobile Camera 0676"

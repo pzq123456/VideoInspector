@@ -40,7 +40,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from server.model_spec import KIND_CLASSIFIER, anchor_uid, parse_gies  # noqa: E402
+from server.model_spec import KIND_CLASSIFIER, KIND_DETECTOR, anchor_uid, parse_gies  # noqa: E402
 
 TEMPLATES = ROOT / "tools" / "templates"
 GENERATED_DIRNAME = "generated"
@@ -152,10 +152,12 @@ def _env_fingerprint() -> dict[str, str | None]:
 
 
 def build_one(name: str, source: str, uid: int, kind: str, violation: str | None,
-              operate_on_uid: int, base: Path, force: bool = False) -> None:
+              operate_on_uid: int, base: Path, force: bool = False,
+              attach: str | None = None) -> None:
     """构建单个模型：pt→onnx→(class0 交换)→engine→<base>/generated/<name>/。
 
-    source 相对路径相对部署根 base 解析；kind/violation 已由 parse_gies 校验。
+    source 相对路径相对部署根 base 解析；kind/violation/attach 已由 parse_gies 校验。
+    attach 非 None 时为二级检测器（process-mode=2，挂在锚点检出框上）。
     """
     gen_root = Path(base) / GENERATED_DIRNAME
     src = Path(source)
@@ -170,7 +172,8 @@ def build_one(name: str, source: str, uid: int, kind: str, violation: str | None
     n_classes = len(names)
     h, w = model_imgsz(model)
     is_classify = (kind == KIND_CLASSIFIER)
-    max_batch = 32 if is_classify else 12
+    is_sgie_det = (kind == KIND_DETECTOR and attach is not None)
+    max_batch = 32 if (is_classify or is_sgie_det) else 12
 
     # violation 校验 + 标签顺序（class0 前置；权重交换只在真正导出时做；
     # classifier 的 violation 由 parse_gies 保证必填）
@@ -184,7 +187,8 @@ def build_one(name: str, source: str, uid: int, kind: str, violation: str | None
 
     # detector 类别裁剪：基础 COCO 模型(>10类)只出 class0(person)；专用模型全量
     num_classes = n_classes if is_classify else (1 if n_classes > BASE_CLASS_THRESHOLD else n_classes)
-    task_tag = " (classifier)" if is_classify else ""
+    task_tag = (" (classifier)" if is_classify
+                else " (sgie-detector)" if is_sgie_det else "")
     print(f"\n### 模型 {name}{task_tag}: {n_classes} 类 -> labels {names} "
           f"(imgsz={h}x{w}, max-batch={max_batch}, uid={uid})")
 
@@ -261,13 +265,16 @@ def build_one(name: str, source: str, uid: int, kind: str, violation: str | None
     (out_dir / LABELS).write_text("\n".join(label_names) + "\n", encoding="utf-8")
     print(f"\n### labels.txt -> {out_dir / LABELS}: {label_names}")
 
-    tpl_name = "sgie_config.ini.tpl" if is_classify else "pgie_config.ini.tpl"
+    tpl_name = ("sgie_config.ini.tpl" if is_classify
+                else "sgie_detector_config.ini.tpl" if is_sgie_det
+                else "pgie_config.ini.tpl")
     tpl = (TEMPLATES / tpl_name).read_text(encoding="utf-8")
     ini = (tpl.replace("{{name}}", name)
               .replace("{{num_classes}}", str(num_classes))
               .replace("{{uid}}", str(uid))
               .replace("{{operate_on_uid}}", str(operate_on_uid)))
-    ini_path = out_dir / ("sgie_config.txt" if is_classify else "pgie_config.txt")
+    ini_path = out_dir / ("sgie_config.txt" if (is_classify or is_sgie_det)
+                          else "pgie_config.txt")
     ini_path.write_text(ini, encoding="utf-8")
 
     print(f"\n### 完成: {name}{task_tag}" +
@@ -298,6 +305,7 @@ def build_from_config(config_path: str, force: bool = False) -> None:
             operate_on_uid=anchor,
             base=base,
             force=force,
+            attach=spec.attach,
         )
 
 

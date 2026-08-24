@@ -214,11 +214,11 @@ def _serve(config: dict, deploy_root: Path):
     # 每个 classifier gie 的 classifier-threshold 由引用它的规则 attribute_threshold 重写
     gie_thresholds = {rule.gie: rule.attribute_threshold for rule in rules.values()}
 
-    # 推理链顺序：锚点 detector 最先 → 其余 detector → classifier（§3.5 约束）
+    # 推理链顺序：锚点 detector 最先 → 其余整帧 detector → 二级模型（§3.5 约束）
+    # 二级 = classifier + 带 attach 的 detector（process-mode=2，作用于锚点检出框）
     ordered = []
-    ordered += [s for s in gies.values() if s.kind == KIND_DETECTOR and s.violation is None]
-    ordered += [s for s in gies.values() if s.kind == KIND_DETECTOR and s.violation is not None]
-    ordered += [s for s in gies.values() if s.kind == KIND_CLASSIFIER]
+    ordered += [s for s in gies.values() if s.kind == KIND_DETECTOR and not s.is_secondary]
+    ordered += [s for s in gies.values() if s.is_secondary]
 
     webhook_cfg = config.get("webhook") or {}
     webhook = None
