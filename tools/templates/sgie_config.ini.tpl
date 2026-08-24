@@ -1,5 +1,5 @@
 # ============================================================================
-# 自动生成: tools/model_build.py --name {{name}} (task=classify, 二级分类器)
+# 自动生成: tools/model_build.py --config ({{name}}, classifier, 二级分类器)
 # 模型: generated/{{name}}/best.onnx（ultralytics classify 导出, Softmax 已烧入）
 #       引擎 generated/{{name}}/best_dyn_fp16.engine（trtexec --fp16 预构建, 动态 batch）
 # 输出: output0 [B,C] = 各类别概率（Softmax 后, 和=1）

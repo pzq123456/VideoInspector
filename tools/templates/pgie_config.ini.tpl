@@ -1,5 +1,5 @@
 # ============================================================================
-# 自动生成: tools/model_build.py --name {{name}}
+# 自动生成: tools/model_build.py --config ({{name}}, detector)
 # 模型: generated/{{name}}/best.onnx（ultralytics NMS 导出, 动态 batch 1~N）
 #       引擎 generated/{{name}}/best_dyn_fp16.engine（trtexec --fp16 预构建）
 #       解析 generated/common/libnvds_yolo_nms.so（全模型共享, 编译一次）

@@ -1,17 +1,12 @@
 #!/usr/bin/env python3
 """
-tools/model_build.py — 从 config（单一事实来源）或 CLI 自动构建 DeepStream 模型产物。
+tools/model_build.py — 从 config（单一事实来源）自动构建 DeepStream 模型产物。
 
-两种用法:
-
-1) 单模型（旧用法，部署根回退到仓库根）:
-   python tools/model_build.py --name vest_cls --pt <classify best.pt> --uid 6 --violation no_vest
-
-2) 读 config（推荐，config 即事实来源）:
-   python tools/model_build.py --config deploy/config.yaml
-   → 部署根 = config.yaml 所在目录（自包含部署单元），遍历 model.gies 逐个:
-     .pt → onnx → (classifier 且 violation 不在 index0 时交换输出通道，
-     使违规类落到 class0) → engine → generated/<name>/labels.txt + INI
+用法:
+    python tools/model_build.py --config deploy/config.yaml [--force]
+    → 部署根 = config.yaml 所在目录（自包含部署单元），遍历 model.gies 逐个:
+      .pt → onnx → (classifier 且 violation 不在 index0 时交换输出通道，
+      使违规类落到 class0) → engine → generated/<name>/labels.txt + INI
 
 产物布局（全部收敛到 <部署根>/generated/，可整目录删除重建）:
   generated/<name>/best.onnx              # 中间产物（供重建引擎）
@@ -45,7 +40,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from server.model_spec import KIND_CLASSIFIER, KIND_DETECTOR, anchor_uid, parse_gies  # noqa: E402
+from server.model_spec import KIND_CLASSIFIER, anchor_uid, parse_gies  # noqa: E402
 
 TEMPLATES = ROOT / "tools" / "templates"
 GENERATED_DIRNAME = "generated"
@@ -55,7 +50,6 @@ ENGINE = "best_dyn_fp16.engine"
 ENGINE_META = "engine.meta.json"
 LABELS = "labels.txt"
 PARSER_SO = "libnvds_yolo_nms.so"
-PARSE_FUNC = "NvDsInferParseCustomYoloNMS"
 INPUT_NAME = "images"  # ultralytics NMS 导出固定输入名
 
 BASE_CLASS_THRESHOLD = 10
@@ -157,19 +151,16 @@ def _env_fingerprint() -> dict[str, str | None]:
     return fp
 
 
-def build_one(name: str, source: str, uid: int, kind: str | None = None,
-              violation: str | None = None, max_batch: int | None = None,
-              operate_on_uid: int = 1, base: Path | None = None,
-              skip_engine: bool = False, force: bool = False) -> None:
+def build_one(name: str, source: str, uid: int, kind: str, violation: str | None,
+              operate_on_uid: int, base: Path, force: bool = False) -> None:
     """构建单个模型：pt→onnx→(class0 交换)→engine→<base>/generated/<name>/。
 
-    source 相对路径相对部署根 base 解析；base 缺省为仓库根（单模型旧用法）。
+    source 相对路径相对部署根 base 解析；kind/violation 已由 parse_gies 校验。
     """
-    base = Path(base) if base else ROOT
-    gen_root = base / GENERATED_DIRNAME
+    gen_root = Path(base) / GENERATED_DIRNAME
     src = Path(source)
     if not src.is_absolute():
-        src = base / src
+        src = Path(base) / src
     if not src.exists():
         sys.exit(f"source 不存在: {src}")
 
@@ -178,21 +169,18 @@ def build_one(name: str, source: str, uid: int, kind: str | None = None,
     names = list(model.names.values())
     n_classes = len(names)
     h, w = model_imgsz(model)
-    is_classify = (kind == KIND_CLASSIFIER) if kind else (model.task == "classify")
-    max_batch = max_batch or (32 if is_classify else 12)
+    is_classify = (kind == KIND_CLASSIFIER)
+    max_batch = 32 if is_classify else 12
 
-    # violation 校验 + 标签顺序（class0 前置；权重交换只在真正导出时做）
+    # violation 校验 + 标签顺序（class0 前置；权重交换只在真正导出时做；
+    # classifier 的 violation 由 parse_gies 保证必填）
     perm = None
-    if violation is not None and is_classify:
+    if is_classify:
         perm = _perm_for_violation(names, violation, name)
         if perm is not None:
             names = [names[i] for i in perm]
-    elif violation is not None:
-        if violation not in names:
-            raise ValueError(f"{name}: violation={violation!r} 不在模型类别 {names} 中")
-        # detector 全类可挂，无需交换，仅校验
-    elif is_classify and violation is None:
-        raise ValueError(f"{name}: classifier 必须声明 violation")
+    elif violation is not None and violation not in names:
+        raise ValueError(f"{name}: violation={violation!r} 不在模型类别 {names} 中")
 
     # detector 类别裁剪：基础 COCO 模型(>10类)只出 class0(person)；专用模型全量
     num_classes = n_classes if is_classify else (1 if n_classes > BASE_CLASS_THRESHOLD else n_classes)
@@ -218,16 +206,12 @@ def build_one(name: str, source: str, uid: int, kind: str | None = None,
 
     # --- 增量判定 ---
     pt_mtime = src.stat().st_mtime
-    need_onnx = (
-        not skip_engine
-        and (force or not onnx_path.exists() or onnx_path.stat().st_mtime < pt_mtime)
-    )
+    need_onnx = force or not onnx_path.exists() or onnx_path.stat().st_mtime < pt_mtime
     env_stale = engine_path.exists() and not _env_match()
     need_engine = (
-        not skip_engine
-        and (force or need_onnx or not engine_path.exists()
-             or engine_path.stat().st_mtime < onnx_path.stat().st_mtime
-             or env_stale)
+        force or need_onnx or not engine_path.exists()
+        or engine_path.stat().st_mtime < onnx_path.stat().st_mtime
+        or env_stale
     )
     if env_stale:
         print(f"### {name}: 环境指纹变化（GPU/TRT 版本不符），引擎需重建")
@@ -238,18 +222,21 @@ def build_one(name: str, source: str, uid: int, kind: str | None = None,
         if perm is not None:
             _apply_class0_swap(model, perm, name, names)
         # --- 1) pt -> onnx (动态 batch) ---
+        # 重定向 exporter 的输出锚点（ultralytics 按 model.pt_path 同名写 onnx），
+        # 使 onnx 直接落到 generated/<name>/，不写源目录 —— models/ 在部署时为
+        # :ro 挂载，任何旁路写入都会直接 PermissionError。
+        model.model.pt_path = str(onnx_path.with_suffix(".pt"))
         if is_classify:
             exported = Path(model.export(format="onnx", dynamic=True, imgsz=(h, w)))
         else:
             exported = Path(model.export(format="onnx", nms=True, dynamic=True,
                                          opset=OP_SET, imgsz=(h, w)))
-        # ultralytics 把 onnx 写到 .pt 同目录（按源文件名 stem）；若与规范名相同则原地保留，
-        # 否则拷贝到 generated/<name>/best.onnx 并清理旁路产物。
+        # 正常情况重定向已直接命中 onnx_path；此块仅为 ultralytics 未来改动后的兜底。
         if exported.resolve() != onnx_path.resolve():
             shutil.copyfile(exported, onnx_path)
             exported.unlink(missing_ok=True)
         print(f"\n### ONNX 已生成: {onnx_path}")
-    elif not skip_engine:
+    else:
         print(f"### {name}: {ONNX} 比 .pt 新，跳过导出")
 
     # --- 2) onnx -> engine (trtexec fp16, 动态 batch) ---
@@ -265,7 +252,7 @@ def build_one(name: str, source: str, uid: int, kind: str | None = None,
             f"--saveEngine={engine_path}",
         ], f"构建 TensorRT 引擎 (动态 batch 1~{max_batch})")
         meta_path.write_text(json.dumps(cur_env, ensure_ascii=False), encoding="utf-8")
-    elif not skip_engine:
+    else:
         print(f"### {name}: {ENGINE} 已是最新且环境一致，跳过 trtexec")
 
     # --- 3) 产物落 generated/<name>/: labels.txt + INI（始终刷新，保证与 config 一致）---
@@ -284,15 +271,14 @@ def build_one(name: str, source: str, uid: int, kind: str | None = None,
     ini_path.write_text(ini, encoding="utf-8")
 
     print(f"\n### 完成: {name}{task_tag}" +
-          ("（仅刷新 labels/INI）" if skip_engine else
-           "" if (need_onnx or need_engine) else "（产物已最新，未重建引擎）"))
+          ("" if (need_onnx or need_engine) else "（产物已最新，未重建引擎）"))
     for rel in (onnx_path, engine_path, out_dir / LABELS, ini_path):
         if rel.exists():
             size_mb = rel.stat().st_size / 1e6
             print(f"    {rel.relative_to(base)}  ({size_mb:.1f} MB)")
 
 
-def build_from_config(config_path: str, skip_engine: bool = False, force: bool = False) -> None:
+def build_from_config(config_path: str, force: bool = False) -> None:
     """读 config.yaml 的 model.gies，逐个构建。部署根 = config.yaml 所在目录。"""
     import yaml
 
@@ -311,46 +297,19 @@ def build_from_config(config_path: str, skip_engine: bool = False, force: bool =
             violation=spec.violation,
             operate_on_uid=anchor,
             base=base,
-            skip_engine=skip_engine,
             force=force,
         )
 
 
 def main():
-    ap = argparse.ArgumentParser(description="DeepStream 模型一键构建 (config 或 CLI)")
-    ap.add_argument("--config", help="读 config.yaml 的 model.gies 构建全部模型（部署根=其所在目录）")
-    ap.add_argument("--name", help="[单模型] 逻辑名，产物写入 <部署根>/generated/<name>/")
-    ap.add_argument("--pt", help="[单模型] ultralytics best.pt 路径（相对路径基于仓库根）")
-    ap.add_argument("--max-batch", type=int, default=None,
-                    help="引擎动态 batch 上限（默认: detector 12 / classify 32）")
-    ap.add_argument("--uid", type=int, default=1, help="gie-unique-id（全局唯一）")
-    ap.add_argument("--kind", choices=[KIND_DETECTOR, KIND_CLASSIFIER], default=None,
-                    help="detector | classifier（缺省按 model.task 自动判定）")
-    ap.add_argument("--violation", default=None, help="报警类标签（classifier 必填）")
-    ap.add_argument("--skip-engine", action="store_true",
-                    help="跳过 parser/onnx/trtexec，只刷新 labels.txt + INI")
+    ap = argparse.ArgumentParser(description="DeepStream 模型一键构建（读 config.yaml 的 model.gies）")
+    ap.add_argument("--config", required=True,
+                    help="config.yaml 路径（部署根 = 其所在目录）")
     ap.add_argument("--force", action="store_true",
                     help="忽略增量检查，强制重新导出 onnx 并重建引擎")
     args = ap.parse_args()
 
-    if args.config:
-        build_from_config(args.config, skip_engine=args.skip_engine, force=args.force)
-        return 0
-
-    if not args.name or not args.pt:
-        ap.error("需要 --config，或同时提供 --name 与 --pt")
-
-    build_one(
-        name=args.name,
-        source=args.pt,
-        uid=args.uid,
-        kind=args.kind,
-        violation=args.violation,
-        max_batch=args.max_batch,
-        base=ROOT,
-        skip_engine=args.skip_engine,
-        force=args.force,
-    )
+    build_from_config(args.config, force=args.force)
     return 0
 
 

@@ -20,30 +20,20 @@ BatchMetadataOperator 探针把每一帧 / 每个检测目标上**实际暴露**
 
 import argparse
 import os
-import re
 import sys
-import tempfile
 from multiprocessing import Process
+from pathlib import Path
 
 from pyservicemaker import Pipeline, Probe, BatchMetadataOperator
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_KEY = ("onnx-file", "model-engine-file", "labelfile-path", "custom-lib-path")
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
+# INI 路径锚定逻辑与运行期共用同一份实现（部署根 = deploy/）
+from server.main import _anchor_ini_config  # noqa: E402
 
-def _anchor(path: str) -> str:
-    """把 INI 内相对项目根的模型路径补全为绝对路径（同 server/main.py）。"""
-    out = []
-    for raw in open(path, encoding="utf-8").read().splitlines():
-        m = re.match(r"^([A-Za-z0-9_-]+)=(.*)$", raw.strip())
-        if m and m.group(1) in _KEY:
-            v = m.group(2).strip()
-            if v and not os.path.isabs(v):
-                raw = f"{m.group(1)}={os.path.join(ROOT, v)}"
-        out.append(raw)
-    f = tempfile.mktemp(suffix=".txt")
-    open(f, "w", encoding="utf-8").write("\n".join(out) + "\n")
-    return f
+DEPLOY_ROOT = ROOT / "deploy"
 
 
 # ---------------------------------------------------------------------------
@@ -212,7 +202,8 @@ def main():
                          "转储二级分类器元数据 (classifier_items/get_n_label)")
     args = ap.parse_args()
 
-    pgie = _anchor(os.path.join(ROOT, "generated", "person", "pgie_config.txt"))
+    pgie = _anchor_ini_config(DEPLOY_ROOT / "generated" / "person" / "pgie_config.txt",
+                              base=DEPLOY_ROOT)
     uri = "file://" + os.path.abspath(args.file)
 
     p = Pipeline("explore-metadata")
@@ -226,7 +217,7 @@ def main():
             prefix = "sgie" if name.endswith("_cls") else "pgie"
             cfg = f"generated/{name}/{prefix}_config.txt"
             p.add("nvinfer", name,
-                  {"config-file-path": _anchor(os.path.join(ROOT, cfg))})
+                  {"config-file-path": _anchor_ini_config(DEPLOY_ROOT / cfg, base=DEPLOY_ROOT)})
             tail = name
     p.add("fakesink", "sink")
     p.link(("src", "mux"), ("", "sink_%u"))
