@@ -70,7 +70,7 @@ rules:
 # -----------------------------------------------------------------------------
 webhook:
   url: "http://alert-receiver:9999/api/ppe-alert"   # 浸泡测试接收端（compose 内网服务名）
-  # 需搭配 --profile soak 启动 alert-receiver；接下游时改回真实地址即可
+  # 需搭配 --profile soak 启动 alert-receiver；接下游时改为真实完整地址即可
   timeout: 10                                   # 请求超时（秒）
   retries: 2                                    # 失败重试次数
 

@@ -23,6 +23,14 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
+# RTSP 输出服务依赖（开发容器曾手动安装的 4 个 apt 包，生产镜像需自带）
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3-gi \
+        gir1.2-gstreamer-1.0 \
+        gir1.2-gst-plugins-base-1.0 \
+        gir1.2-gst-rtsp-server-1.0 \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY requirements.txt ./
 RUN python3 -m pip install --no-cache-dir --break-system-packages \
     -r requirements.txt

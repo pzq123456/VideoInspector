@@ -1,28 +1,22 @@
-# =============================================================================
-# 生产编排: 镜像只含代码+依赖；部署根四件套经卷挂载注入 /app/deploy/。
-# 使用: cd deploy && docker compose up -d --build
-#   - 首次启动自动增量构建引擎（分钟级），之后重启秒级跳过
-#   - 换模型 = 替换 models/ 下 .pt → 重启容器即自动重建加载
-#   - 浸泡测试（可选）: docker compose --profile soak up -d
-#     额外启动告警接收端，JSONL+证据帧落 ./alerts/，次日复盘
-# =============================================================================
 services:
   detector:
     build:
       context: ..
       dockerfile: deploy/Dockerfile
     image: safety-detector:latest
+    pull_policy: build
     container_name: safety-detector
     runtime: nvidia
+    privileged: true
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
-      - NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility,video,display  
     shm_size: "1g"
 
     volumes:
-      - ./config.yaml:/app/deploy/config.yaml:ro   # 配置（改后重启生效，无需重建镜像）
-      - ./models:/app/deploy/models:ro             # .pt 模型源
-      - ./generated:/app/deploy/generated          # 引擎/onnx/INI —— 宿主机持久化
+      - ./config.yaml:/app/deploy/config.yaml:ro
+      - ./models:/app/deploy/models:ro
+      - ./generated:/app/deploy/generated
       - ./logs:/app/deploy/logs
 
     ports:
@@ -31,19 +25,26 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
+    networks:
+      - safety-net
+
     restart: unless-stopped
 
-  # ---------------------------------------------------------------------------
-  # 告警接收端（可选，浸泡测试专用）: docker compose --profile soak up -d
-  #   复用 detector 镜像零额外构建；不发布端口，仅 compose 内网可达。
-  #   产物落宿主机 ./alerts/: payload.jsonl（告警记录）+ <camera_id>/*.jpg（证据帧）
-  # ---------------------------------------------------------------------------
   alert-receiver:
-    image: safety-detector:latest
+    image: python:3.11-slim          # 轻量接收端：python + loguru 足矣，勿复用主推理镜像
     container_name: alert-receiver
     profiles: ["soak"]
-    command: python3 /app/receiver.py --port 9999 --save-dir /app/alerts
+    working_dir: /app
+    command: >
+      sh -c "pip install --no-cache-dir loguru==0.7.3 &&
+             python3 -u /app/receiver.py --port 9999 --save-dir /app/alerts"
     volumes:
       - ../local/webhook_receiver.py:/app/receiver.py:ro
       - ./alerts:/app/alerts
+    networks:
+      - safety-net
     restart: unless-stopped
+
+networks:
+  safety-net:
+    driver: bridge
