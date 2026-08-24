@@ -1,3 +1,5 @@
+name: video-inspector
+
 services:
   detector:
     build:
