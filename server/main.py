@@ -26,6 +26,7 @@ import os
 import re
 import sys
 import tempfile
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from multiprocessing import Process
 from pathlib import Path
@@ -188,6 +189,33 @@ def _clean_stale_shm_sockets(socket_path: str, logger) -> None:
             logger.warning("清理残留 shm socket 失败: {} ({})", p, exc)
 
 
+def _forward_stdout_to_logger(logger) -> None:
+    """把 C++ 层写进 fd1 的输出（measure_fps_probe 的 **FPS 心跳等）转发到 loguru。
+
+    measure_fps_probe 用 std::cout 直打 stdout，绕过 Python 日志系统，导致
+    server.log 里没有任何运行期心跳。这里在进程内把 fd1 换成管道，由后台
+    线程逐行读回并经 loguru 输出（console + 文件双落）。
+    """
+    r, w = os.pipe()
+    os.dup2(w, 1)
+    os.close(w)
+
+    def _pump():
+        buf = b""
+        while True:
+            chunk = os.read(r, 4096)
+            if not chunk:
+                break
+            buf += chunk
+            *lines, buf = buf.split(b"\n")
+            for line in lines:
+                text = line.decode(errors="replace").strip()
+                if text:
+                    logger.info("gst| {}", text)
+
+    threading.Thread(target=_pump, daemon=True, name="stdout-forward").start()
+
+
 # ============================================================================
 # 子进程: 构建并运行 DeepStream pipeline
 # ============================================================================
@@ -203,6 +231,7 @@ def _serve(config: dict, deploy_root: Path):
         level=log_cfg.get("level", "INFO"),
         log_file=log_file,
     )
+    _forward_stdout_to_logger(logger)
     logger.info("startup safety_detection_server")
 
     model = config["model"]
@@ -269,6 +298,10 @@ def _serve(config: dict, deploy_root: Path):
         p.add("nvurisrcbin", f"src{i}", {
             "uri": cam["rtsp_url"],
             "select-rtp-protocol": rtsp_protocol,
+            # 断流重连：30s 无数据才重连，无限次（0=禁用）；
+            # 间隔放宽避免重连风暴冲击不稳定的对端网关
+            "rtsp-reconnect-interval": 30,
+            "rtsp-reconnect-attempts": -1,
         })
         p.link((f"src{i}", "mux"), ("", "sink_%u"))  # CRITICAL: 必须用 "sink_%u"
 
