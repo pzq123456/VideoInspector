@@ -77,14 +77,14 @@ rules:
   smoking:
     gie: smoke
     cooldown_seconds: 30
-    min_detection_count: 5
-    attribute_threshold: 0.5
+    min_detection_count: 3
+    attribute_threshold: 0.7
 
 # -----------------------------------------------------------------------------
 # Webhook 告警推送（alert_type 为触发的规则名，如 "no_vest"）
 # -----------------------------------------------------------------------------
 webhook:
-  url: "http://alert-receiver:9999/api/ppe-alert"   # 浸泡测试接收端（compose 内网服务名）
+  url: "http://192.168.1.24:6034/protal/ai-alarm/webhook"   # 浸泡测试接收端（compose 内网服务名）
   # 需搭配 --profile soak 启动 alert-receiver；接下游时改为真实完整地址即可
   timeout: 10                                   # 请求超时（秒）
   retries: 2                                    # 失败重试次数
@@ -99,19 +99,19 @@ cameras:
     name: "Mobile Camera 1363"
     rtsp_url: "rtsp://118.140.234.166:8554/dahua1001182"
     enabled: true
-    active_rules: ["no_helmet", "no_vest", "no_harness"]
+    active_rules: ["no_helmet", "no_vest", "no_harness", "smoking"]
 
   - id: "1384"
     name: "Mobile Camera 1384"
     rtsp_url: "rtsp://118.140.234.166:8554/dahua1001204"
     enabled: true
-    active_rules: ["no_helmet", "no_vest", "no_harness"]
+    active_rules: ["no_helmet", "no_vest", "no_harness", "smoking"]
 
   - id: "1385"
     name: "Mobile Camera 1385"
     rtsp_url: "rtsp://118.140.234.166:8554/dahua1001723"
     enabled: true
-    active_rules: ["no_helmet", "no_vest", "no_harness"]
+    active_rules: ["no_helmet", "no_vest", "no_harness", "smoking"]
 
   - id: "671"
     name: "Mobile Camera 0671"
@@ -123,13 +123,13 @@ cameras:
     name: "Mobile Camera 0676"
     rtsp_url: "rtsp://118.140.234.166:8554/dahua1000325"
     enabled: true
-    active_rules: ["no_helmet", "no_vest", "no_harness"]
+    active_rules: ["no_helmet", "no_vest", "no_harness", "smoking"]
 
   - id: "891"
     name: "Mobile Camera 0891"
     rtsp_url: "rtsp://118.140.234.166:8554/dahua1000352"
     enabled: true
-    active_rules: ["no_helmet", "no_vest", "no_harness"]
+    active_rules: ["no_helmet", "no_vest", "no_harness", "smoking"]
 
 # -----------------------------------------------------------------------------
 # RTSP 输入

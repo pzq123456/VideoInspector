@@ -12,5 +12,5 @@ docker compose --profile soak up -d --build
 
 docker compose up -d --build --no-cache
 
-docker compose up
+docker compose up -d
 docker compose down
