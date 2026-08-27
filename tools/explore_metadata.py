@@ -31,7 +31,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 # INI 路径锚定逻辑与运行期共用同一份实现（部署根 = deploy/）
-from server.main import _anchor_ini_config  # noqa: E402
+from server.pipeline.ini_patch import anchor_ini_config as _anchor_ini_config  # noqa: E402
 
 DEPLOY_ROOT = ROOT / "deploy"
 

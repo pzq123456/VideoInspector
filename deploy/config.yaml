@@ -136,8 +136,23 @@ cameras:
 # -----------------------------------------------------------------------------
 # rtsp_protocol: 输入传输协议（nvurisrcbin select-rtp-protocol）
 #   4 = TCP（推荐） | 1 = UDP | 2 = UDP-MCAST | 7 = 自动
+#
+# reconnect: RTSP 断流自愈（Plan A + B）
+#   attempts       nvurisrcbin 内置重连次数上限。必须为有限值：DS7.x 上内置重连
+#                  在网络闪断后可能永久卡死，-1 无限重试只会空转死循环。
+#   timeout        多少秒无数据包判定断流（5s 偏激进易误判，推荐 10s）
+#   interval       重连尝试间隔秒数（过长拖慢恢复，过短形成重连风暴）
+#   latency        jitterbuffer 缓冲 ms；过大延迟断流判定，500 通常够用
+#   stall_seconds  看门狗阈值：出现重连后连续这么久无健康帧心跳，则判定管线
+#                  不可恢复 → 子进程退出(exitcode=2) → 主进程整体重建管线
 source:
   rtsp_protocol: 4
+  reconnect:
+    attempts: 5
+    timeout: 10
+    interval: 10
+    latency: 500
+    stall_seconds: 180
 
 # -----------------------------------------------------------------------------
 # RTSP 输出（注释掉 output 节即关闭）
