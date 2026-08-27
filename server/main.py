@@ -298,12 +298,20 @@ def _serve(config: dict, deploy_root: Path):
         p.add("nvurisrcbin", f"src{i}", {
             "uri": cam["rtsp_url"],
             "select-rtp-protocol": rtsp_protocol,
-            # 断流重连：30s 无数据才重连，无限次（0=禁用）；
-            # 间隔放宽避免重连风暴冲击不稳定的对端网关
-            "rtsp-reconnect-interval": 30,
-            "rtsp-reconnect-attempts": -1,
+            
+            # 1. 尝试重连的次数：-1 为无限次
+            "rtsp-reconnect-attempts": -1,       
+            
+            # 2. 探针/超时检测：5~10 秒无数据包即判定断流（推荐 5s 或 10s）
+            "rtsp-reconnect-timeout": 5,        
+            
+            # 3. 每次重连失败后的等待间隔：2~3 秒（既不会造成频繁重试的重连风暴，又能快速恢复）
+            "rtsp-reconnect-interval": 3,       
+            
+            # 4. 消除网络抖动引发的误判断流（缓冲 1~2 秒数据）
+            "latency": 1000,                    
         })
-        p.link((f"src{i}", "mux"), ("", "sink_%u"))  # CRITICAL: 必须用 "sink_%u"
+        p.link((f"src{i}", "mux"), ("", "sink_%u"))
 
     # 推理链（对齐官方 test5：nvinfer 之间补 queue）
     prev = "mux"
