@@ -20,6 +20,13 @@ from server.config import EXIT_PIPELINE_STUCK, DEFAULT_RECONNECT
 
 _RESET_RE = re.compile(r"Resetting source (-?\d+), attempts: (\d+)")
 _FPS_RE = re.compile(r"\*\*FPS:")
+# FPS 行格式: "**FPS:  24.60 (12.26)\t25.00 (12.95)" — 每源两列: 瞬时 (均值)
+_FPS_VAL_RE = re.compile(r"(\d+(?:\.\d+)?)\s+\(")
+
+
+def _any_positive_fps(line: str) -> bool:
+    """FPS 心跳行里是否存在任一源的瞬时帧率 > 0。"""
+    return any(float(v) > 0 for v in _FPS_VAL_RE.findall(line))
 
 
 class PipelineStuckError(RuntimeError):
@@ -46,23 +53,24 @@ class StreamWatchdog:
             self._saw_reset_since_healthy = True
             if attempt > self._max_attempt_seen:
                 self._max_attempt_seen = attempt
-            # 单一来源计数器一路上涨却始终未见恢复 → 重连循环空转
-            if self._attempts_limit > 0 and attempt >= self._attempts_limit and (
-                now - self._last_healthy > self._stall_seconds
-            ):
-                self._trigger("reconnect 循环无进展", f"attempts={attempt}")
-            return
+        # FPS 心跳：只有存在瞬时 FPS > 0 的源才算活性信号。
+        # 全 0 心跳（**FPS:  0.00 (x.xx) ...）不算健康——attempts 耗尽后 nvurisrcbin
+        # 僵死，mux 仍按 batched-push-timeout 出空批次，FPS probe 会持续打 0.00，
+        # 此前版本把这类心跳当活性导致看门狗永不触发（2026-08-27 事故根因）。
+        elif _FPS_RE.search(line):
+            if _any_positive_fps(line):
+                self._last_healthy = now
+                self._saw_reset_since_healthy = False
+                self._max_attempt_seen = 0
+            else:
+                self._saw_reset_since_healthy = True
 
-        # FPS 心跳：出现即为活性信号（哪怕瞬时 0.00，也说明 mux 还在推帧）
-        if _FPS_RE.search(line) and not line.endswith("0.00\t"):
-            self._last_healthy = now
-            self._saw_reset_since_healthy = False
-            self._max_attempt_seen = 0
-            return
-
-        # 无任何活性信号超过 stall_seconds 且期间发生过断流重连 → 卡死
+        # 卡死判定（每行统一出口）:
+        # 出现过断流且超过 stall_seconds 没有任何健康帧 → 僵死。
+        # attempts 耗尽后连 Resetting 日志都会消失，只剩全 0 心跳，只能靠此条件兜底。
         if self._saw_reset_since_healthy and now - self._last_healthy > self._stall_seconds:
-            self._trigger("长时间无健康帧心跳", f"{now - self._last_healthy:.0f}s")
+            self._trigger("长时间无健康帧心跳", f"{now - self._last_healthy:.0f}s, "
+                                             f"max_attempts={self._max_attempt_seen}")
 
     def _trigger(self, reason: str, detail: str) -> None:
         import threading
