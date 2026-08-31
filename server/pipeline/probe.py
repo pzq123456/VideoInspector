@@ -58,11 +58,13 @@ class SafetyProbe(BatchMetadataOperator):
                  rules: dict[str, RuleConfig] | None = None,
                  person_uid: int = 1,
                  person_conf_threshold: float = 0.6,
-                 active_rules_by_source: dict[int, set[str]] | None = None):
+                 active_rules_by_source: dict[int, set[str]] | None = None,
+                 health=None):
         super().__init__()
         self._managers = alert_managers
         self._executor = executor
         self._frame_cache = frame_cache
+        self._health = health   # SourceHealthMonitor（可选）: 逐路帧计数供看门狗判定
         self._gies = gies or {}
         self._rules = rules or {}
         self._person_uid = person_uid
@@ -81,8 +83,11 @@ class SafetyProbe(BatchMetadataOperator):
                 self._known_labels.add(spec.violation)
 
     def handle_metadata(self, batch_meta):
+        health_record = self._health.record if self._health is not None else None
         for frame_meta in batch_meta.frame_items:
             source_id = frame_meta.source_id
+            if health_record is not None:
+                health_record(source_id)
             active = self._active_rules_by_source.get(source_id, self._all_rules)
 
             active_detector_uids: set[int] = set()

@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 
 from server.pipeline.builder import PipelineBuilder
+from server.pipeline.health import SourceHealthMonitor
 from server.utils.logger import setup_logger
 from server.utils.stdio import forward_stdout_to_logger
 from server.watchdog import StreamWatchdog
@@ -26,16 +27,22 @@ def serve(config: dict, deploy_root: Path) -> None:
         level=log_cfg.get("level", "INFO"),
         log_file=log_file,
     )
-    watchdog = StreamWatchdog((config.get("source") or {}).get("reconnect"))
+    src_cfg = config.get("source") or {}
+    watchdog = StreamWatchdog(src_cfg.get("reconnect"),
+                              maintenance_window=(src_cfg.get("health") or {}).get("maintenance_window"))
     forward_stdout_to_logger(logger, on_line=watchdog.feed)
     logger.info("startup safety_detection_server")
 
     builder = PipelineBuilder(config, deploy_root)
-    runtime = builder.build(logger)
+    health = SourceHealthMonitor(builder.cameras,
+                                 (config.get("source") or {}).get("health"))
+    runtime = builder.build(logger, health=health)
+    health.start()
     logger.info("pipeline started cameras={}", len(builder.cameras))
     try:
         runtime["pipeline"].start().wait()
     finally:
+        health.stop()
         if runtime["rtsp_server"] is not None:
             runtime["rtsp_server"].stop()
         runtime["executor"].shutdown(wait=False, cancel_futures=True)

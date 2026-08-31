@@ -80,6 +80,7 @@ def validate_config(config: dict, path: Path):
         errors.append(f"webhook.timeout 必须是正数，当前: {timeout!r}")
 
     errors.extend(_validate_source_reconnect((config.get("source") or {}).get("reconnect")))
+    errors.extend(_validate_source_health(((config.get("source") or {}).get("health")) or {}))
 
     if errors:
         raise ValueError(f"配置校验失败 ({path}):\n  " + "\n  ".join(errors))
@@ -108,6 +109,31 @@ def _validate_source_reconnect(rc_raw) -> list[str]:
     return errors
 
 
+def _validate_source_health(h_raw) -> list[str]:
+    errors = []
+    h = h_raw or {}
+    checks = (
+        ("source_stall_seconds", 60),
+        ("check_interval", 10),
+        ("min_uptime_seconds", 0),
+        ("rebuild_cost_seconds", 60),
+        ("min_rebuild_interval", 60),
+    )
+    for key, minimum in checks:
+        v = h.get(key)
+        if v is not None and (err := _validate_int(v, f"source.health.{key}", minimum)):
+            errors.append(err)
+    window = h.get("maintenance_window")
+    if window is not None:
+        try:
+            hh, mm = (int(x) for x in str(window).split(":"))
+            if not (0 <= hh < 24 and 0 <= mm < 60):
+                raise ValueError
+        except ValueError:
+            errors.append(f"source.health.maintenance_window 必须是 HH:MM（UTC），当前: {window!r}")
+    return errors
+
+
 def resolve_path(base: Path, p: str) -> str:
     """把配置里的相对路径解析为绝对路径（相对部署根 = config.yaml 所在目录）。"""
     return p if Path(p).is_absolute() else str(base / p)
@@ -121,9 +147,26 @@ EXIT_PIPELINE_STUCK = 2
 DEFAULT_RECONNECT = {
     # nvurisrcbin 内置重连：消耗完 attempts 后该路源进入僵死状态，
     # 由看门狗检测并退出子进程、监督循环全量重建管线（见 server/watchdog.py）。
-    "attempts": 5,        # 内置重连次数上限（有限值，不做无限空转）
+    "attempts": 10,       # 内置重连次数上限（有限值，不做无限空转；有外层兜底可适当放大）
     "timeout": 10,        # 多少秒无数据包即判为断流（5s 偏激进易误判）
     "interval": 10,       # 重连尝试间隔（秒）
     "latency": 500,       # jitterbuffer 缓冲（ms），过大延迟超时判定
     "stall_seconds": 180, # 连续多久没有任何健康帧心跳则认为管线卡死
+}
+
+# 逐路健康监控默认参数（可由 source.health 覆盖，见 server/pipeline/health.py）
+# 决策 = 带切换成本的在线区间覆盖: min(K·|R| + α·Σ UncoveredTime)
+DEFAULT_HEALTH = {
+    "source_stall_seconds": 300,     # 该路超过 N 秒无帧 → stalled（未覆盖起点）
+    "check_interval": 30,            # 巡检周期（秒）
+    "min_uptime_seconds": 120,       # 子进程启动预热期，期内不判定
+    # 代价阈值 K（未覆盖相机秒）: W=Σ未覆盖时长 ≥ K 且距上次重建足够久 → 重建。
+    # 单路断约 15min 攒够，两路 7.5min——多路断自动加速，即 batching 防抖。
+    "rebuild_cost_seconds": 900,
+    # 防风暴硬地板: 两次重建最小间隔。重建后相机仍离线时 W 重新累积，
+    # 但最快也只按此间隔重试"相机已回归但 DS 已放弃"的场景。
+    "min_rebuild_interval": 1800,
+    # 网关每日定时重启的 UTC 时刻（北京时间 00:04 = UTC 16:04）±5min 内只
+    # 积累 W 不动手，窗口结束后一并结算——计划内重启顺延收编窗口期上线相机
+    "maintenance_window": "16:04",
 }

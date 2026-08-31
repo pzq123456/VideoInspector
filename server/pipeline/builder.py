@@ -70,8 +70,11 @@ class PipelineBuilder:
         self.cameras = [c for c in config.get("cameras") or [] if c.get("enabled", True)]
 
     # ------------------------------------------------------------------ 构建
-    def build(self, logger) -> dict:
-        """构建并返回 {pipeline, last_infer, frame_cache, executor, rtsp_server}。"""
+    def build(self, logger, health=None) -> dict:
+        """构建并返回 {pipeline, frame_cache, executor, rtsp_server}。
+
+        health: 可选 SourceHealthMonitor，接到 SafetyProbe 做逐路帧计数。
+        """
         cfg = self.config
         num = len(self.cameras)
         out = cfg.get("output")
@@ -91,6 +94,7 @@ class PipelineBuilder:
             person_uid=self.person_uid,
             person_conf_threshold=self.person_conf_threshold,
             active_rules_by_source=self._active_rules_by_source(),
+            health=health,
         )))
         p.attach(last_infer, "measure_fps_probe", name="fps-probe")
 

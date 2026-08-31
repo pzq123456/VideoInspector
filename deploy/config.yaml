@@ -140,19 +140,47 @@ cameras:
 # reconnect: RTSP 断流自愈（Plan A + B）
 #   attempts       nvurisrcbin 内置重连次数上限。必须为有限值：DS7.x 上内置重连
 #                  在网络闪断后可能永久卡死，-1 无限重试只会空转死循环。
+#                  耗尽后该路进入"零信号僵尸态"，由 health 看门狗逐路发现并重建。
 #   timeout        多少秒无数据包判定断流（5s 偏激进易误判，推荐 10s）
 #   interval       重连尝试间隔秒数（过长拖慢恢复，过短形成重连风暴）
 #   latency        jitterbuffer 缓冲 ms；过大延迟断流判定，500 通常够用
 #   stall_seconds  看门狗阈值：出现重连后连续这么久无健康帧心跳，则判定管线
 #                  不可恢复 → 子进程退出(exitcode=2) → 主进程整体重建管线
+#
+# health: 逐路健康监控（Phase 1，server/pipeline/health.py）
+#   SafetyProbe 按帧的 source_id 统计每路最近出帧时刻，发现 DS 内置重连
+#   看不见的"僵尸路"（不重连、不报错、但也不再出帧）。
+#   优化模型 = 带切换成本的在线区间覆盖: min(K·|R| + α·Σ未覆盖时长)，
+#   相机动态上下线不可预知，用代价累积决定何时花一次重建代价。
+#   source_stall_seconds    该路超过 N 秒无帧 → stalled（未覆盖起点，恢复即清零）
+#   check_interval          巡检周期秒数
+#   min_uptime_seconds      子进程启动预热期，期内不判定（源连接需要时间）
+#   rebuild_cost_seconds    代价阈值 K: 累积未覆盖 W=Σ未覆盖秒 ≥ K 且距上次
+#                           重建 ≥ min_rebuild_interval → 重建。
+#                           单路断 ~15min 攒够；两路 ~7.5min——多路断自动加速
+#   min_rebuild_interval    防风暴硬地板: 相机仍离线时 W 会重新累积，
+#                           但最快按此间隔重试"相机已回归"的拾取
+#   maintenance_window      网关每日定时重启的 UTC 时刻（北京时间 00:04
+#                           = UTC 16:04），窗口 ±5min 内只积累不动手，窗口后
+#                           一并结算——计划内重启顺延收编窗口期上线相机
+#                           （stalled 路数 ≥ 一半则绕过 W/间隔立即升级）
+#   maintenance_window      网关每日定时重启的 UTC 时刻（北京时间 00:04
+#                           = UTC 16:04），窗口 ±5min 内只记录不动作
 source:
   rtsp_protocol: 4
   reconnect:
-    attempts: 5
+    attempts: 10
     timeout: 10
     interval: 10
     latency: 500
     stall_seconds: 180
+  health:
+    source_stall_seconds: 300
+    check_interval: 30
+    min_uptime_seconds: 120
+    rebuild_cost_seconds: 900
+    min_rebuild_interval: 1800
+    maintenance_window: "16:04"
 
 # -----------------------------------------------------------------------------
 # RTSP 输出（注释掉 output 节即关闭）
