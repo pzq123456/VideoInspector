@@ -6,14 +6,17 @@ tools/model_build.py — 从 config（单一事实来源）自动构建 DeepStre
     python tools/model_build.py --config deploy/config.yaml [--force]
     → 部署根 = config.yaml 所在目录（自包含部署单元），遍历 model.gies 逐个:
       .pt → onnx → (classifier 且 violation 不在 index0 时交换输出通道，
-      使违规类落到 class0) → engine → generated/<name>/labels.txt + INI
+      使违规类落到 class0) → engine → generated/<name>/<版本键>/labels.txt + INI
 
-产物布局（全部收敛到 <部署根>/generated/，可整目录删除重建）:
-  generated/<name>/best.onnx              # 中间产物（供重建引擎）
-  generated/<name>/best_dyn_fp16.engine   # 运行期引擎（环境绑定）
-  generated/<name>/labels.txt             # 类别标签（violation 前置）
-  generated/<name>/(pgie|sgie)_config.txt # 生成的 nvinfer 配置（运行期读取）
-  generated/common/libnvds_yolo_nms.so    # 共享 parser（detector 用，编译一次）
+产物布局（全部收敛到 <部署根>/generated/，可整目录删除重建；一版一目录）:
+  generated/<name>/<版本键>/best.onnx              # 中间产物（供重建引擎）
+  generated/<name>/<版本键>/best_dyn_fp16.engine   # 运行期引擎（环境绑定）
+  generated/<name>/<版本键>/labels.txt             # 类别标签（violation 前置）
+  generated/<name>/<版本键>/(pgie|sgie)_config.txt # 生成的 nvinfer 配置（运行期读取）
+  generated/common/libnvds_yolo_nms.so             # 共享 parser（detector 用，编译一次）
+  版本键 = source 相对 models/ 的父目录路径（server/model_spec.artifact_version
+  统一推导）。换 config.source 即写新目录、旧版本原样留存 → 回滚零重建；
+  约定版本目录不可变，换模型 = 新建版本文件夹（原地替换 .pt 属违规操作）。
 
 增量构建（容器启动场景友好）:
   - best.onnx 比 .pt 新           → 跳过 ultralytics 导出
@@ -40,7 +43,13 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from server.model_spec import KIND_CLASSIFIER, KIND_DETECTOR, anchor_uid, parse_gies  # noqa: E402
+from server.model_spec import (  # noqa: E402
+    KIND_CLASSIFIER,
+    KIND_DETECTOR,
+    anchor_uid,
+    artifact_version,
+    parse_gies,
+)
 
 TEMPLATES = ROOT / "tools" / "templates"
 GENERATED_DIRNAME = "generated"
@@ -151,10 +160,57 @@ def _env_fingerprint() -> dict[str, str | None]:
     return fp
 
 
+LEGACY_FILES = (ONNX, ENGINE, ENGINE_META, LABELS, "pgie_config.txt", "sgie_config.txt")
+
+
+def _migrate_legacy_layout(legacy_dir: Path, out_dir: Path, name: str,
+                           expected_labels: list[str]) -> None:
+    """一次性迁移: 旧扁平布局 generated/<name>/{...} → generated/<name>/<版本键>/。
+
+    rename（同文件系统）保留 mtime 且 engine.meta.json 随行，迁移后增量判定
+    全命中 → 升级当天启动零重建、零人工步骤。新装机器无旧布局，零影响。
+
+    校验: 旧 labels.txt 必须与当前 source 推导的标签一致——旧扁平目录里的产物
+    理应是当前 source 对应版本（历史运维方式恒成立），不符即 fail loud（产物
+    归属不明，静默迁移会复活「权重与标签错配」的老坑），提示人工处置。
+    """
+    legacy_onnx = legacy_dir / ONNX
+    if not legacy_onnx.exists():
+        return
+    if (out_dir / ONNX).exists():
+        print(f"### {name}: 旧扁平产物与版本目录并存（{out_dir} 已有产物）——"
+              f"旧产物原样保留，请人工确认后删除 {legacy_dir} 下的散落文件")
+        return
+
+    legacy_labels = legacy_dir / LABELS
+    if legacy_labels.exists():
+        got = [ln for ln in legacy_labels.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        if got != expected_labels:
+            sys.exit(
+                f"{name}: 旧扁平产物疑似不属于当前 source（labels 不一致:\n"
+                f"    旧 {got}\n    新 {expected_labels}）\n"
+                f"  拒绝自动迁移。请人工处置后重试:\n"
+                f"    - 归档: mv {legacy_dir} <备份路径> && rm -f {legacy_dir}\n"
+                f"    - 或确认作废后直接删除: rm -rf {legacy_dir}"
+            )
+    else:
+        print(f"### {name}: 旧扁平产物缺少 labels.txt，无法校验版本归属，仅按 mtime 链继续")
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    moved = []
+    for fname in LEGACY_FILES:
+        src = legacy_dir / fname
+        if src.exists():
+            shutil.move(str(src), str(out_dir / fname))
+            moved.append(fname)
+    print(f"### {name}: 已迁移旧扁平布局 → {out_dir}（{', '.join(moved)}）"
+          f"—— mtime/指纹保留，命中增量判定则零重建")
+
+
 def build_one(name: str, source: str, uid: int, kind: str, violation: str | None,
               operate_on_uid: int, base: Path, force: bool = False,
               attach: str | None = None) -> None:
-    """构建单个模型：pt→onnx→(class0 交换)→engine→<base>/generated/<name>/。
+    """构建单个模型：pt→onnx→(class0 交换)→engine→<base>/generated/<name>/<版本键>/。
 
     source 相对路径相对部署根 base 解析；kind/violation/attach 已由 parse_gies 校验。
     attach 非 None 时为二级检测器（process-mode=2，挂在锚点检出框上）。
@@ -192,7 +248,14 @@ def build_one(name: str, source: str, uid: int, kind: str, violation: str | None
     print(f"\n### 模型 {name}{task_tag}: {n_classes} 类 -> labels {names} "
           f"(imgsz={h}x{w}, max-batch={max_batch}, uid={uid})")
 
-    out_dir = gen_root / name
+    # 产物目录：generated/<name>/<版本键>/（版本键由 source 推导，见 model_spec.artifact_version）
+    # 命中旧扁平布局（升级自版本化之前）则先自动迁移，保证升级当天零重建。
+    # 校验标签与下方落盘的 label_names 同一推导（classifier 已换序 / detector 裁剪）。
+    ver_key = artifact_version(source)
+    gen_name_dir = gen_root / name
+    out_dir = gen_name_dir / ver_key
+    _migrate_legacy_layout(gen_name_dir, out_dir, name,
+                           expected_labels=names if is_classify else names[:num_classes])
     out_dir.mkdir(parents=True, exist_ok=True)
     onnx_path = out_dir / ONNX
     engine_path = out_dir / ENGINE
@@ -227,7 +290,7 @@ def build_one(name: str, source: str, uid: int, kind: str, violation: str | None
             _apply_class0_swap(model, perm, name, names)
         # --- 1) pt -> onnx (动态 batch) ---
         # 重定向 exporter 的输出锚点（ultralytics 按 model.pt_path 同名写 onnx），
-        # 使 onnx 直接落到 generated/<name>/，不写源目录 —— models/ 在部署时为
+        # 使 onnx 直接落到 generated/<name>/<版本键>/，不写源目录 —— models/ 在部署时为
         # :ro 挂载，任何旁路写入都会直接 PermissionError。
         model.model.pt_path = str(onnx_path.with_suffix(".pt"))
         if is_classify:
@@ -259,7 +322,7 @@ def build_one(name: str, source: str, uid: int, kind: str, violation: str | None
     else:
         print(f"### {name}: {ENGINE} 已是最新且环境一致，跳过 trtexec")
 
-    # --- 3) 产物落 generated/<name>/: labels.txt + INI（始终刷新，保证与 config 一致）---
+    # --- 3) 产物落 generated/<name>/<版本键>/: labels.txt + INI（始终刷新，保证与 config 一致）---
     # detector 按 num-detected-classes 裁剪标签；classifier 全量（violation 已前置）
     label_names = names if is_classify else names[:num_classes]
     (out_dir / LABELS).write_text("\n".join(label_names) + "\n", encoding="utf-8")
@@ -270,6 +333,7 @@ def build_one(name: str, source: str, uid: int, kind: str, violation: str | None
                 else "pgie_config.ini.tpl")
     tpl = (TEMPLATES / tpl_name).read_text(encoding="utf-8")
     ini = (tpl.replace("{{name}}", name)
+              .replace("{{ver}}", ver_key)
               .replace("{{num_classes}}", str(num_classes))
               .replace("{{uid}}", str(uid))
               .replace("{{operate_on_uid}}", str(operate_on_uid)))

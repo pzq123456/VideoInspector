@@ -1,7 +1,7 @@
 # ============================================================================
 # 自动生成: tools/model_build.py --config ({{name}}, detector)
-# 模型: generated/{{name}}/best.onnx（ultralytics NMS 导出, 动态 batch 1~N）
-#       引擎 generated/{{name}}/best_dyn_fp16.engine（trtexec --fp16 预构建）
+# 模型: generated/{{name}}/{{ver}}/best.onnx（ultralytics NMS 导出, 动态 batch 1~N）
+#       引擎 generated/{{name}}/{{ver}}/best_dyn_fp16.engine（trtexec --fp16 预构建）
 #       解析 generated/common/libnvds_yolo_nms.so（全模型共享, 编译一次）
 # 输出: output0 [B,300,6] = [x1,y1,x2,y2,conf,cls]（post-NMS, 网络输入空间）
 # 类别裁剪: 由 num-detected-classes 决定, class_id < num-detected-classes 才输出
@@ -13,9 +13,9 @@
 gpu-id=0
 net-scale-factor=0.00392156862745098
 model-color-format=0
-onnx-file=generated/{{name}}/best.onnx
-model-engine-file=generated/{{name}}/best_dyn_fp16.engine
-labelfile-path=generated/{{name}}/labels.txt
+onnx-file=generated/{{name}}/{{ver}}/best.onnx
+model-engine-file=generated/{{name}}/{{ver}}/best_dyn_fp16.engine
+labelfile-path=generated/{{name}}/{{ver}}/labels.txt
 network-mode=2
 num-detected-classes={{num_classes}}
 process-mode=1

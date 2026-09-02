@@ -32,8 +32,16 @@ if str(ROOT) not in sys.path:
 
 # INI 路径锚定逻辑与运行期共用同一份实现（部署根 = deploy/）
 from server.pipeline.ini_patch import anchor_ini_config as _anchor_ini_config  # noqa: E402
+from server.model_spec import parse_gies  # noqa: E402
 
 DEPLOY_ROOT = ROOT / "deploy"
+
+
+def _load_gies() -> dict:
+    """从 deploy/config.yaml 解析 gie 规格（INI 路径含版本键，与编译期同一推导）。"""
+    import yaml
+    cfg = yaml.safe_load((DEPLOY_ROOT / "config.yaml").read_text(encoding="utf-8"))
+    return parse_gies((cfg.get("model") or {}).get("gies"))
 
 
 # ---------------------------------------------------------------------------
@@ -202,7 +210,8 @@ def main():
                          "转储二级分类器元数据 (classifier_items/get_n_label)")
     args = ap.parse_args()
 
-    pgie = _anchor_ini_config(DEPLOY_ROOT / "generated" / "person" / "pgie_config.txt",
+    gies = _load_gies()
+    pgie = _anchor_ini_config(DEPLOY_ROOT / gies["person"].config_path(),
                               base=DEPLOY_ROOT)
     uri = "file://" + os.path.abspath(args.file)
 
@@ -214,10 +223,9 @@ def main():
     tail = "pgie"
     if args.full:
         for name in ("helmet", "harness_cls", "vest_cls"):
-            prefix = "sgie" if name.endswith("_cls") else "pgie"
-            cfg = f"generated/{name}/{prefix}_config.txt"
             p.add("nvinfer", name,
-                  {"config-file-path": _anchor_ini_config(DEPLOY_ROOT / cfg, base=DEPLOY_ROOT)})
+                  {"config-file-path": _anchor_ini_config(
+                      DEPLOY_ROOT / gies[name].config_path(), base=DEPLOY_ROOT)})
             tail = name
     p.add("fakesink", "sink")
     p.link(("src", "mux"), ("", "sink_%u"))

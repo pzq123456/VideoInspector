@@ -7,8 +7,14 @@ config.yaml 的 model.gies 节是模型拓扑的单一事实来源：
 - violation       报警类（即「no_xxx」对应的模型类别名；锚点检测器无此字段）
 
 运行期（server/main.py、probe.py）只消费 GieSpec，不关心模型怎么编译；
-编译期（tools/model_build.py --config）据此生成 <部署根>/generated/<name>/ 下的 INI + labels.txt。
+编译期（tools/model_build.py --config）据此生成
+<部署根>/generated/<name>/<版本键>/ 下的 INI + labels.txt。
 部署根 = config.yaml 所在目录；source 相对路径与产物路径均相对部署根解析。
+
+产物按「版本键」分目录（一版一目录，永不原地覆盖）：
+  版本键 = source 相对 models/ 的父目录路径（如 models/vest/VER/weights/best.pt
+  → "vest/VER"）；换 config.source 即换目录，旧版本产物原样留存 → 秒回滚零重建。
+  编译期与运行期必须用同一份推导（artifact_version），不得各写各的。
 """
 
 from __future__ import annotations
@@ -19,6 +25,30 @@ from pathlib import Path
 KIND_DETECTOR = "detector"
 KIND_CLASSIFIER = "classifier"
 KNOWN_KINDS = (KIND_DETECTOR, KIND_CLASSIFIER)
+
+MODELS_DIRNAME = "models"  # source 的约定根目录（compose 以 ./models :ro 挂载）
+
+
+def artifact_version(source: str) -> str:
+    """从 source 路径推导产物版本键（编译期/运行期共享，单一实现）。
+
+    规则: 取 source 相对 models/ 的父目录路径（约定尾段 weights/ 为 ultralytics
+    训练布局，剔除），如
+      models/vest/yolo26mcls_ppeVest_20260902_1104/weights/best.pt → vest/yolo26mcls_ppeVest_20260902_1104
+      models/helmet/yolo26s_helm_20260804_0844/weights/best.pt     → helmet/yolo26s_helm_20260804_0844
+      models/person/yolo26n.pt                                     → person（无版本子目录时的兜底形态）
+    路径中不含 models/ 段时退回文件名 stem（fail-safe，仍可定位唯一目录）。
+    """
+    src = Path(source)
+    parts = src.parts
+    if MODELS_DIRNAME in parts:
+        i = parts.index(MODELS_DIRNAME)
+        segs = [p for p in parts[i + 1:-1] if p != ".."]
+        if segs and segs[-1] == "weights":
+            segs = segs[:-1]
+        if segs:
+            return "/".join(segs)
+    return src.stem
 
 
 @dataclass(frozen=True)
@@ -37,10 +67,20 @@ class GieSpec:
         """二级模型（附属在锚点检出框上推理）：classifier 恒真，detector 看 attach。"""
         return self.kind == KIND_CLASSIFIER or self.attach is not None
 
+    @property
+    def version(self) -> str:
+        """产物版本键（由 source 推导，编译期/运行期一致）。"""
+        return artifact_version(self.source)
+
+    @property
+    def artifact_dir(self) -> str:
+        """产物目录（相对部署根）：generated/<name>/<版本键>/。"""
+        return f"generated/{self.name}/{self.version}"
+
     def config_path(self) -> str:
-        """生成的 nvinfer INI 路径（generated/<name>/ 下）。"""
+        """生成的 nvinfer INI 路径（generated/<name>/<版本键>/ 下）。"""
         prefix = "sgie_config" if self.is_secondary else "pgie_config"
-        return f"generated/{self.name}/{prefix}.txt"
+        return f"{self.artifact_dir}/{prefix}.txt"
 
 
 def parse_gies(raw: dict | None) -> dict[str, GieSpec]:

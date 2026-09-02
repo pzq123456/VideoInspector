@@ -20,19 +20,23 @@ python local/webhook_receiver.py                           # （可选）模拟�
 ```
 deploy/
 ├── config.yaml        # 唯一事实来源：模型拓扑 + 规则 + 摄像头（部署根锚点）
-├── models/            # .pt 模型源（人工维护，不入库）
-└── generated/         # 全部构建产物（可整目录删除重建）
+├── models/            # .pt 模型源（人工维护，一版一文件夹，不入库）
+└── generated/         # 全部构建产物（可整目录删除重建；产物按版本键分目录）
     ├── common/libnvds_yolo_nms.so
-    └── <name>/{best.onnx, best_dyn_fp16.engine, labels.txt, pgie|sgie_config.txt}
+    └── <name>/<版本键>/{best.onnx, best_dyn_fp16.engine, labels.txt, pgie|sgie_config.txt}
 server/
 ├── main.py            # 入口：读 config → 构建 pipeline → 运行
-├── model_spec.py      # model.gies 的声明式解析/校验
+├── model_spec.py      # model.gies 的声明式解析/校验（含版本键推导 artifact_version）
 ├── metadata.py        # 数据契约 ObjectMeta / AttributeMeta
 ├── pipeline/          # probe(元数据→告警) / frame_cache(证据帧) / rtsp_server(输出)
 ├── alert/             # manager(状态机) / rules(规则配置) / webhook(推送)
 └── utils/logger.py
-tools/model_build.py   # pt→onnx→(class0 交换)→engine→generated/（增量 + --force）
+tools/model_build.py   # pt→onnx→(class0 交换)→engine→generated/（增量 + --force + 旧布局自动迁移）
 ```
+
+版本键 = source 相对 `models/` 的父目录路径（如 `models/vest/yolo26mcls_ppeVest_20260902_1104/...`
+→ `vest/yolo26mcls_ppeVest_20260902_1104`）。换 `config.source` 即构建到新目录，
+旧版本产物原样留存 → 回滚零重建；版本目录不可变，换模型 = 新建版本文件夹。
 
 ## 配置要点
 

@@ -39,7 +39,7 @@ model:
 
     vest_cls:                                  # 反光衣二级分类器（新模型，修复 §6 预处理脆弱）
       kind: classifier
-      source: models/vest/yolo26mcls_ppeVest_20260820_0923/weights/best.pt
+      source: models/vest/yolo26mcls_ppeVest_20260902_0954/weights/best.pt
       uid: 6
       violation: no_vest                       # 原 index0，无需交换
 
