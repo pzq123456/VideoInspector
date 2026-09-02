@@ -186,7 +186,7 @@ class AlertManager:
                         alert_objects: list[ObjectMeta], iso_timestamp: str):
         """JPEG 编码在 executor 线程执行（C 扩展，释放 GIL）。
 
-        snapshot 已由 nvdsosd 原生渲染（含检测框 + 违规标签），无需再画框。
+        snapshot 已由 nvdsosd 原生渲染（只含违规红框 + 违规标签），无需再画框。
         base64 / JSON / HTTP POST 交由独立 daemon 线程 fire-and-forget，
         executor 线程立即返回，不等待网络响应。
         """

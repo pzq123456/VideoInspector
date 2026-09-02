@@ -8,9 +8,9 @@ SafetyProbe（BatchMetadataOperator）只拿得到 batch 元数据、拿不到�
     demux.src_i → nvdsosd_i → tee_i → [ rtsp 支路 | 证据支路 ]
                                           └── queue → nvvideoconvert → capsfilter(NVMM RGB) → appsink
 
-nvdsosd_i 已在该路帧上**原生渲染**检测框/违规标签（SafetyProbe 上色），
-appsink 采集到的即是与实时预览一致的完整 OSD 渲染帧（且已按 source 隔离，
-不会跨流污染）。appsink 的 FrameCaptureRetriever.consume() 把最新一帧转成
+nvdsosd_i 已在该路帧上**原生渲染**违规红框/违规标签（SafetyProbe 决定渲染内容，
+非违规对象显式隐藏），appsink 采集到的即是与实时预览一致的 OSD 渲染帧（且已按
+source 隔离，不会跨流污染）。appsink 的 FrameCaptureRetriever.consume() 把最新一帧转成
 BGR numpy 缓存进 FrameCache（{source_id: frame}）。告警触发时探针从缓存取
 该 source 的帧作为 snapshot 交给 AlertManager，由 executor 线程 JPEG 编码。
 

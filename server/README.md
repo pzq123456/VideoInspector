@@ -76,8 +76,9 @@ RTSP×N → nvstreammux(batch=N) → nvinfer(person) → queue → nvinfer(helme
 ```
 
 探针挂在最后一个 nvinfer，把元数据翻译成 `ObjectMeta` 喂给对应摄像头的 `AlertManager`
-（按规则独立状态机 `IDLE→ARMING→COOLDOWN`），并给对象上色（违规红 / 其余蓝）。
-classifier 合规类不可观测，故无绿框。
+（按规则独立状态机 `IDLE→ARMING→COOLDOWN`），并决定 OSD 渲染内容：只画违规 person
+的红框 + 违规标签，detector 检测框 / 合规与低置信度 person 一律隐藏（证据帧与预览
+同此策略，画面只关注违规者）。
 
 ## Webhook payload
 

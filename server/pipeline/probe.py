@@ -3,7 +3,16 @@ DeepStream 探针 → 告警状态机桥（配置驱动）
 
 把两阶段检测（person 锚点整帧检测 + detector 整帧 + classifier 二级分类）的 batch
 元数据翻译成 server.metadata.ObjectMeta 列表，按 source_id 喂给对应的 AlertManager；
-同时给对象上色（nvdsosd 原生渲染，证据帧与实时预览共享同一渲染源）。
+同时决定 OSD 渲染内容（nvdsosd 原生渲染，证据帧与实时预览共享同一渲染源）。
+
+渲染策略「一刀切干净」：nvdsosd 默认会把每个对象按默认色画出来，因此**不画 = 显式隐藏**
+（rect_params.border_width=0 + 清空 text_params.display_text——nvosd 对未设置 text 的
+对象会自动显示 obj_label/分类器标签）。只保留违规 person 的红框 + 违规标签，其余一律
+隐藏：detector 检测框（head/helmet/cigarette）、合规 person、低于置信度门槛的 person。
+证据帧因此只含违规者标注，预览同。
+
+nvosd 经验值：违规框 border_width 实测 2 不上屏、4 起正常渲染，取 4（1080p 下粗细
+与辨识度均衡，GPU 光栅化对小宽度有下限）。
 
 模型拓扑来自 config（model.gies + rules），探针不再硬编码任何 uid/规则名：
   - detector（如 helmet）：整帧检测器，空间关联（检测框中心落在 person 框内且
@@ -14,7 +23,7 @@ DeepStream 探针 → 告警状态机桥（配置驱动）
 约束（与旧版一致）:
   - 本探针在 GStreamer 流线程运行，只做轻量决策；JPEG/base64/HTTP 由 AlertManager
     内部 executor + daemon 线程处理。
-  - 上色必须在同一 pass 内完成（object_items 是一次性迭代器，不能跨 pass 持有包装器）。
+  - 隐藏/上色必须在同一 pass 内完成（object_items 是一次性迭代器，不能跨 pass 持有包装器）。
 """
 
 from __future__ import annotations
@@ -29,9 +38,12 @@ from server.metadata import AttributeMeta, ObjectMeta
 from server.model_spec import KIND_CLASSIFIER, KIND_DETECTOR
 from server.alert.rules import RuleConfig
 
-RED = osd.Color(1.0, 0.0, 0.0, 1.0)    # 违规
-GREEN = osd.Color(0.0, 1.0, 0.0, 1.0)  # detector 框：合规类
-BLUE = osd.Color(0.0, 0.0, 1.0, 1.0)   # person：无违规
+RED = osd.Color(1.0, 0.0, 0.0, 1.0)    # 违规（唯一上屏色）
+
+# 隐藏对象的两件事：边宽置 0（nvosd 不画框）+ 显式清空 display_text
+# （nvosd 对未设置 text 的对象会自动显示 obj_label，如 helmet/person，必须显式压掉）
+_HIDE_BOX = 0
+_HIDE_TEXT = b""
 
 # 分类器置信度解析失败时的回退值（payload 展示用，判定由 classifier-threshold 负责）
 CLASSIFIER_FALLBACK_CONF = 0.5
@@ -97,29 +109,30 @@ class SafetyProbe(BatchMetadataOperator):
                     active_detector_uids.add(uid)
 
             # 第一趟: 收集 detector 检测框的普通数值（label/conf/中心点），不持有包装器；
-            # 同时给这些框上色（violation=红，其余=绿）。
+            # 同时隐藏这些框（违规呈现统一收敛到 person 红框 + 标签，不画 detector 框）。
             detector_boxes: dict[int, list] = {}
             for uid in active_detector_uids:
                 boxes = []
                 for o in frame_meta.object_items:  # 一次性迭代器
                     if o.unique_component_id == uid:
-                        violation = self._uid_violation(uid)
-                        label = getattr(o, "label", "")
-                        o.rect_params.border_color = RED if label == violation else GREEN
+                        o.rect_params.border_width = _HIDE_BOX
+                        o.text_params.display_text = _HIDE_TEXT
                         boxes.append((
-                            label,
+                            getattr(o, "label", ""),
                             o.confidence,
                             o.rect_params.left + o.rect_params.width / 2,
                             o.rect_params.top + o.rect_params.height / 2,
                         ))
                 detector_boxes[uid] = boxes
 
-            # 第二趟: 每个 person → ObjectMeta（违规进 attributes）+ 状态上色
+            # 第二趟: 每个 person → ObjectMeta（违规进 attributes）+ 渲染决策
             objects: list[ObjectMeta] = []
             for obj in frame_meta.object_items:
                 if obj.unique_component_id != self._person_uid:
                     continue
                 if obj.confidence < self._person_conf_threshold:
+                    obj.rect_params.border_width = _HIDE_BOX  # 噪声框/字也须显式隐藏
+                    obj.text_params.display_text = _HIDE_TEXT
                     continue
 
                 attrs: list[AttributeMeta] = []
@@ -138,13 +151,14 @@ class SafetyProbe(BatchMetadataOperator):
                         if label == violation:
                             attrs.append(AttributeMeta(rule_name, CLASSIFIER_FALLBACK_CONF))
 
-                # 有违规=红；无违规=蓝（classifier 合规类不可观测，无绿框）
+                # 有违规=红框+标签；无违规=隐藏（classifier 合规类不可观测）
                 if attrs:
-                    obj.rect_params.border_width = 2
+                    obj.rect_params.border_width = 4  # nvosd 怪癖: 2 不上屏，见模块 docstring
                     obj.rect_params.border_color = RED
                     self._set_osd_label(obj, " ".join(a.name for a in attrs))
                 else:
-                    obj.rect_params.border_color = BLUE
+                    obj.rect_params.border_width = _HIDE_BOX
+                    obj.text_params.display_text = _HIDE_TEXT
 
                 objects.append(ObjectMeta(
                     class_name="person",
@@ -167,15 +181,6 @@ class SafetyProbe(BatchMetadataOperator):
                 manager.handle(objects, snapshot=snapshot, executor=self._executor)
             elif objects:
                 logger.debug("source_id={} 无对应 AlertManager，跳过告警判定", source_id)
-
-    # ------------------------------------------------------------------
-    # 内部: 预解析辅助
-    # ------------------------------------------------------------------
-    def _uid_violation(self, uid: int) -> str | None:
-        for rule_name, (u, kind, violation) in self._rule_binding.items():
-            if u == uid and kind == KIND_DETECTOR:
-                return violation
-        return None
 
     # ------------------------------------------------------------------
     # 静态工具
