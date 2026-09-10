@@ -132,18 +132,31 @@ cameras:
     enabled: true
     active_rules: ["smoking"]
   
-  # ppe 
+  # smoking YTM 2026.9.10
+  - id: "2168"
+    name: "ST_FX_DO_WE_2168"
+    rtsp_url: "rtsp://118.140.234.166:8554/dahua2168"
+    enabled: true
+    active_rules: ["smoking"]
+  
+  - id: "2172"
+    name: "ST_FX_DO_WE_2172"
+    rtsp_url: "rtsp://118.140.234.166:8554/dahua2172"
+    enabled: true
+    active_rules: ["smoking"]
+
+  # ppe SWH 2026.9.10
   - id: "1824"
-    name: "Mobile Camera 1824"
+    name: "ZoneC_Outdoor_001(1824)"
     rtsp_url: "rtsp://118.140.234.166:8554/dahua1824"
     enabled: true
-    active_rules: ["no_helmet", "no_vest"]
+    active_rules: ["no_helmet", "no_vest", "smoking"]
   
   - id: "1825"
-    name: "Mobile Camera 1825"
+    name: "ZoneC_Outdoor_002(1825)"
     rtsp_url: "rtsp://118.140.234.166:8554/dahua1825"
     enabled: true
-    active_rules: ["no_helmet", "no_vest"]
+    active_rules: ["no_helmet", "no_vest", "smoking"]
 
 
 # -----------------------------------------------------------------------------
