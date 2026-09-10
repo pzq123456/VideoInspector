@@ -95,41 +95,56 @@ webhook:
 # 多路 RTSP 输入（引擎为动态 batch，支持任意路数；每路一个 AlertManager）。
 # active_rules 只声明本路要判定/计算/渲染的规则（引用 rules 节的名称）。
 cameras:
+  # smoking
   - id: "1363"
     name: "Mobile Camera 1363"
     rtsp_url: "rtsp://118.140.234.166:8554/dahua1001182"
     enabled: true
-    active_rules: ["no_helmet", "no_vest", "no_harness", "smoking"]
+    active_rules: ["smoking"]
 
   - id: "1384"
     name: "Mobile Camera 1384"
     rtsp_url: "rtsp://118.140.234.166:8554/dahua1001204"
     enabled: true
-    active_rules: ["no_helmet", "no_vest", "no_harness", "smoking"]
+    active_rules: ["smoking"]
 
   - id: "1385"
     name: "Mobile Camera 1385"
     rtsp_url: "rtsp://118.140.234.166:8554/dahua1001723"
     enabled: true
-    active_rules: ["no_helmet", "no_vest", "no_harness", "smoking"]
+    active_rules: ["smoking"]
 
   - id: "671"
     name: "Mobile Camera 0671"
     rtsp_url: "rtsp://118.140.234.166:8554/dahua1000330"
     enabled: true
-    active_rules: ["no_helmet", "no_vest", "no_harness", "smoking"]
+    active_rules: ["smoking"]
 
   - id: "676"
     name: "Mobile Camera 0676"
     rtsp_url: "rtsp://118.140.234.166:8554/dahua1000325"
     enabled: true
-    active_rules: ["no_helmet", "no_vest", "no_harness", "smoking"]
+    active_rules: ["smoking"]
 
   - id: "891"
     name: "Mobile Camera 0891"
     rtsp_url: "rtsp://118.140.234.166:8554/dahua1000352"
     enabled: true
-    active_rules: ["no_helmet", "no_vest", "no_harness", "smoking"]
+    active_rules: ["smoking"]
+  
+  # ppe 
+  - id: "1824"
+    name: "Mobile Camera 1824"
+    rtsp_url: "rtsp://118.140.234.166:8554/dahua1824"
+    enabled: true
+    active_rules: ["no_helmet", "no_vest"]
+  
+  - id: "1825"
+    name: "Mobile Camera 1825"
+    rtsp_url: "rtsp://118.140.234.166:8554/dahua1825"
+    enabled: true
+    active_rules: ["no_helmet", "no_vest"]
+
 
 # -----------------------------------------------------------------------------
 # RTSP 输入
