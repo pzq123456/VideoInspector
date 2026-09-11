@@ -64,9 +64,9 @@ rules:
 
   no_vest:
     gie: vest_cls
-    cooldown_seconds: 30
-    min_detection_count: 10
-    attribute_threshold: 0.7
+    cooldown_seconds: 300
+    min_detection_count: 15
+    attribute_threshold: 0.8
 
   no_harness:
     gie: harness_cls
@@ -137,13 +137,13 @@ cameras:
     name: "ST_FX_DO_WE_2168"
     rtsp_url: "rtsp://118.140.234.166:8554/dahua2168"
     enabled: true
-    active_rules: ["smoking", "no_vest", "smoking"]
+    active_rules: ["no_vest", "smoking"]
   
   - id: "2172"
     name: "ST_FX_DO_WE_2172"
     rtsp_url: "rtsp://118.140.234.166:8554/dahua2172"
     enabled: true
-    active_rules: ["smoking", "no_vest", "smoking"]
+    active_rules: ["no_vest", "smoking"]
 
   # ppe + smoking SWH 2026.9.10
   - id: "1824"
