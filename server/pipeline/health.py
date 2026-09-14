@@ -32,7 +32,6 @@ import threading
 import time
 from datetime import datetime, timedelta
 
-from server.config import EXIT_PIPELINE_STUCK
 from server.watchdog import exit_process
 
 
@@ -130,11 +129,30 @@ class SourceHealthMonitor:
         ages = self.snapshot()
         stalled = {i for i, a in ages.items() if a is None or a > self._stall_seconds}
 
+        # 逐路原始事实行（保持不变：诊断源，供代码/精确排查使用）
         for i, cam_id in enumerate(self._camera_ids):
             age = ages[i]
             status = "no-frame-yet" if age is None else (f"{age:.0f}s-ago")
             logger.info("health src={} camera={} frames={} last_frame={}",
                         i, cam_id, self._frames[i], status)
+
+        # 状态摘要（新增，唯一新增的观测行）:
+        # - 只暴露已存在的内存事实，不重新推断（never/zombie 直接采用 _ever_alive）；
+        # - 用 camera ID（SSH 下直接回答 Q2，无需回查 src→camera）；
+        # - 第一版不做 degraded 自动判定（低 FPS 继续由 frames 跨周期观察）；
+        # - 不加逐路 remaining（last_frame + stall 阈值已足够，需要时人算）。
+        with self._lock:
+            ever = list(self._ever_alive)
+        ordered = sorted(stalled)
+        stalled_ids = [self._camera_ids[i] for i in ordered]
+        zombie_ids = [self._camera_ids[i] for i in ordered if ever[i]]
+        never_ids = [self._camera_ids[i] for i in ordered if not ever[i]]
+        alive_ids = [self._camera_ids[i] for i in range(len(self._camera_ids))
+                     if i not in stalled]
+        logger.info("health summary stall={:.0f}s alive=[{}] stalled=[{}] never=[{}] zombie=[{}]",
+                    self._stall_seconds,
+                    ",".join(alive_ids), ",".join(stalled_ids),
+                    ",".join(never_ids), ",".join(zombie_ids))
 
         # 维护未覆盖起点（stall_start）: 停滞即记起点，恢复即清零
         for i in range(len(self._camera_ids)):
@@ -160,31 +178,63 @@ class SourceHealthMonitor:
         zombie = sorted(i for i in stalled if ever[i])
         never = sorted(stalled - set(zombie))
 
-        # --- 代价模型: W = Σ 未覆盖相机秒（自停滞起点累积） ---
-        W = sum(now - s for s in self._stall_start if s is not None)
+        # --- 代价模型: W_zombie = Σ 运行中停滞相机秒（仅 zombie 参与决策；
+        # _stall_start 仍记录全量 source 事实，never 仅观察不参与重建） ---
+        W_zombie = sum(
+            now - self._stall_start[i]
+            for i in zombie
+            if self._stall_start[i] is not None
+        )
         since_rebuild = now - self._last_rebuild
 
-        if len(stalled) * 2 >= n:
-            self._escalate(logger, f"{len(stalled)}/{n} 路停滞（≥半数立即升级）", stalled)
-        elif W >= self._rebuild_cost and since_rebuild >= self._min_rebuild_interval:
-            self._escalate(logger,
-                           f"累积未覆盖 W={W:.0f}s ≥ K={self._rebuild_cost:.0f}s"
-                           f"（zombie={zombie} never={never}）", stalled)
+        if len(zombie) * 2 >= n:
+            self._escalate(
+                logger,
+                reason="stalled-half",
+                detail=f"{len(zombie)}/{n} 路运行中停滞（≥半数立即升级）",
+                stalled_ids=[self._camera_ids[i] for i in sorted(stalled)],
+                never_ids=[self._camera_ids[i] for i in never],
+                zombie_ids=[self._camera_ids[i] for i in zombie],
+                W=W_zombie,
+                K=None,
+                since_rebuild=since_rebuild,
+            )
+        elif zombie and W_zombie >= self._rebuild_cost and since_rebuild >= self._min_rebuild_interval:
+            self._escalate(
+                logger,
+                reason="stalled-cost",
+                detail=(f"累积未覆盖 W={W_zombie:.0f}s ≥ K={self._rebuild_cost:.0f}s"
+                        f"（zombie={zombie} never={never}）"),
+                stalled_ids=[self._camera_ids[i] for i in sorted(stalled)],
+                never_ids=[self._camera_ids[i] for i in never],
+                zombie_ids=[self._camera_ids[i] for i in zombie],
+                W=W_zombie,
+                K=self._rebuild_cost,
+                since_rebuild=since_rebuild,
+            )
         else:
             logger.warning(
                 "health: stalled={} (zombie={} never={}) W={:.0f}/{:.0f}s "
                 "距上次重建 {:.0f}s/{:.0f}s，观察中",
-                sorted(stalled), zombie, never, W, self._rebuild_cost,
+                sorted(stalled), zombie, never, W_zombie, self._rebuild_cost,
                 since_rebuild, self._min_rebuild_interval)
 
     @staticmethod
-    def _escalate(logger, reason: str, stalled: set[int]) -> None:
-        logger.error("health: 判定需重建管线: {} (stalled={})，退出码={}",
-                     reason, sorted(stalled), EXIT_PIPELINE_STUCK)
-        exit_process("source-stalled", reason)
+    def _escalate(logger, *, reason: str, detail: str,
+                  stalled_ids: list, never_ids: list, zombie_ids: list,
+                  W: float, K: float | None, since_rebuild: float) -> None:
+        """最终决定记录：只序列化 _check() 已算好的事实，不重新计算任何状态。
 
-    @staticmethod
-    def _escalate(logger, reason: str, stalled: set[int]) -> None:
-        logger.error("health: 判定需重建管线: {} (stalled={})，退出码={}",
-                     reason, sorted(stalled), EXIT_PIPELINE_STUCK)
-        exit_process("source-stalled", reason)
+        health decision 是唯一事实源，本方法只是 decision 的投影；
+        统一经 exit_process() 落一条 fatal（trigger=health），保证一次
+        restart 只有一个明确归因。
+        """
+        _ = logger  # 日志统一由 exit_process() 落 fatal，此处不再另打一条
+        extra = (f"stalled=[{','.join(stalled_ids)}] "
+                 f"never=[{','.join(never_ids)}] "
+                 f"zombie=[{','.join(zombie_ids)}] "
+                 f"W={W:.0f}s")
+        if K is not None:
+            extra += f" K={K:.0f}s"
+        extra += f" since_rebuild={since_rebuild:.0f}s"
+        exit_process("health", reason, detail, extra)

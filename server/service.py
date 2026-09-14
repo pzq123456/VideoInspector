@@ -5,6 +5,7 @@
 由 server/main.py 的监督循环决定是否重建。
 """
 
+import multiprocessing
 import os
 from pathlib import Path
 
@@ -38,7 +39,9 @@ def serve(config: dict, deploy_root: Path) -> None:
                                  (config.get("source") or {}).get("health"))
     runtime = builder.build(logger, health=health)
     health.start()
-    logger.info("pipeline started cameras={}", len(builder.cameras))
+    # 生命周期锚点：与 fatal/restart 行的 process 同源，供重启因果链关联新一代进程。
+    logger.info("pipeline started process={} cameras={}",
+                multiprocessing.current_process().name, len(builder.cameras))
     try:
         runtime["pipeline"].start().wait()
     finally:

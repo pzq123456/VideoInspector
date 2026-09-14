@@ -63,7 +63,9 @@ def _run_supervised(config: dict, deploy_root: Path) -> int:
             return exitcode or 0
 
         wait = min(2 * attempt, 30)
-        print(f"pipeline exited code={exitcode} (attempt {attempt}), "
+        # 生命周期锚点：process 与子进程内 fatal 的 process 同源
+        #（子进程的 multiprocessing.current_process().name）；老关键字保留做兼容。
+        print(f"pipeline process={proc.name} exited code={exitcode} (attempt {attempt}), "
               f"restarting in {wait}s", flush=True)
         time.sleep(wait)
 

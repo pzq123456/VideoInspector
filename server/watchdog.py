@@ -30,16 +30,32 @@ def _any_positive_fps(line: str) -> bool:
     return any(float(v) > 0 for v in _FPS_VAL_RE.findall(line))
 
 
-def exit_process(reason: str, detail: str) -> None:
-    """子进程统一退出入口：health.py 与本模块共用。"""
+def exit_process(trigger: str, reason: str, detail: str = "", extra: str = "") -> None:
+    """子进程统一退出入口（唯一的 fatal 落点）：health.py 与本模块共用。
+
+    约定：fatal 只记录已经做出的决定。调用方传入已算好的上下文（extra），
+    本函数只补 process 身份（multiprocessing.current_process().name，即
+    监督循环所起的 safety-pipeline-{attempt}），不重新计算任何状态。
+    格式：fatal trigger=<health|watchdog> reason=<code> process=<name>
+          [<extra>] detail="<人话>" exitcode=2
+    """
     from loguru import logger as _log
     from server.config import EXIT_PIPELINE_STUCK
 
     try:
-        _log.error("看门狗判定管线不可恢复: {} ({})，退出码={} 等待监督循环重建",
-                   reason, detail, EXIT_PIPELINE_STUCK)
+        import multiprocessing
+        proc = multiprocessing.current_process().name
     except Exception:
-        print(f"[watchdog] pipeline stuck: {reason} ({detail})", flush=True)
+        proc = "unknown"
+    try:
+        if extra:
+            _log.error('fatal trigger={} reason={} process={} {} detail="{}" exitcode={} 等待监督循环重建',
+                       trigger, reason, proc, extra, detail, EXIT_PIPELINE_STUCK)
+        else:
+            _log.error('fatal trigger={} reason={} process={} detail="{}" exitcode={} 等待监督循环重建',
+                       trigger, reason, proc, detail, EXIT_PIPELINE_STUCK)
+    except Exception:
+        print(f"[fatal] trigger={trigger} reason={reason} process={proc} {extra} ({detail})", flush=True)
 
     import os
     os._exit(EXIT_PIPELINE_STUCK)
@@ -92,5 +108,6 @@ class StreamWatchdog:
             self._triggered = True
             detail = (f"{now - self._last_healthy:.0f}s 无健康帧, "
                       f"max_attempts={self._max_attempt_seen}")
-            threading.Thread(target=exit_process, args=("长时间无健康帧心跳", detail),
+            extra = f"stall={self._stall_seconds:.0f}s"
+            threading.Thread(target=exit_process, args=("watchdog", "no-healthy-frame", detail, extra),
                              daemon=True, name="watchdog-exit").start()
