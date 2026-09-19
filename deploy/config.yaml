@@ -158,6 +158,30 @@ cameras:
     enabled: true
     active_rules: ["no_helmet", "no_vest", "smoking"]
 
+  - id: "720"
+    name: "720"
+    rtsp_url: "rtsp://118.140.234.166:8554/dahua1001722"
+    enabled: true
+    active_rules: ["no_helmet", "no_vest", "smoking"]
+  
+  - id: "1439"
+    name: "1439"
+    rtsp_url: "rtsp://118.140.234.166:8554/dahua1001274"
+    enabled: true
+    active_rules: ["no_helmet", "no_vest"]
+
+  - id: "1195"
+    name: "1195"
+    rtsp_url: "rtsp://118.140.234.166:8554/dahua1001547"
+    enabled: true
+    active_rules: ["no_helmet", "no_vest"]
+
+  - id: "2201"
+    name: "2201"
+    rtsp_url: "rtsp://118.140.234.166:8554/dahua1002609"
+    enabled: true
+    active_rules: ["no_helmet", "no_vest"]
+
 
 # -----------------------------------------------------------------------------
 # RTSP 输入
