@@ -143,9 +143,10 @@ def _apply_class0_swap(model, perm: list[int], name: str, new_names: list[str]) 
     print(f"### {name}: violation 已换到 class0（新顺序 {new_names}）")
 
 
-def _env_fingerprint() -> dict[str, str | None]:
-    """当前构建环境指纹：引擎与 GPU 型号/算力 + TensorRT 版本绑定，跨机不可复用。"""
-    fp: dict[str, str | None] = {}
+def _env_fingerprint(max_batch: int) -> dict:
+    """当前构建环境指纹：引擎与 GPU 型号/算力 + TensorRT 版本绑定，跨机不可复用。
+    max_batch 一并纳入指纹：它是引擎的硬上限，变更后必须重建（否则静默沿用旧上限）。"""
+    fp: dict = {}
     try:
         import torch
         major, minor = torch.cuda.get_device_capability(0)
@@ -157,6 +158,7 @@ def _env_fingerprint() -> dict[str, str | None]:
         fp["trt"] = tensorrt.__version__
     except Exception:
         fp["trt"] = None
+    fp["max_batch"] = max_batch
     return fp
 
 
@@ -229,7 +231,7 @@ def build_one(name: str, source: str, uid: int, kind: str, violation: str | None
     h, w = model_imgsz(model)
     is_classify = (kind == KIND_CLASSIFIER)
     is_sgie_det = (kind == KIND_DETECTOR and attach is not None)
-    max_batch = 32 if (is_classify or is_sgie_det) else 12
+    max_batch = 32
 
     # violation 校验 + 标签顺序（class0 前置；权重交换只在真正导出时做；
     # classifier 的 violation 由 parse_gies 保证必填）
@@ -260,7 +262,7 @@ def build_one(name: str, source: str, uid: int, kind: str, violation: str | None
     onnx_path = out_dir / ONNX
     engine_path = out_dir / ENGINE
     meta_path = out_dir / ENGINE_META
-    cur_env = _env_fingerprint()
+    cur_env = _env_fingerprint(max_batch)
 
     def _env_match() -> bool:
         """引擎是否由当前环境构建——meta 缺失或指纹不符一律视为过期。"""
@@ -281,7 +283,7 @@ def build_one(name: str, source: str, uid: int, kind: str, violation: str | None
         or env_stale
     )
     if env_stale:
-        print(f"### {name}: 环境指纹变化（GPU/TRT 版本不符），引擎需重建")
+        print(f"### {name}: 环境指纹变化（GPU/TRT/最大batch 不符），引擎需重建")
     if not is_classify:
         compile_shared_parser(gen_root)
 
