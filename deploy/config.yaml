@@ -181,6 +181,12 @@ cameras:
     rtsp_url: "rtsp://118.140.234.166:8554/dahua1002609"
     enabled: true
     active_rules: ["no_helmet", "no_vest"]
+  
+  - id: "669"
+    name: "AI Camera0669"
+    rtsp_url: "rtsp://118.140.234.166:8554/dahua1002452"
+    enabled: true
+    active_rules: ["smoking"]
 
 
 # -----------------------------------------------------------------------------
