@@ -195,18 +195,22 @@ class PipelineBuilder:
 
         rtsp_mounts: dict[str, str] = {}
         for i in range(len(self.cameras)):
+            # 证据支路直接接在 demux 之后，采集**未经 OSD 的原始帧**；违规框/标签由
+            # AlertManager 在 JPEG 编码前用 ObjectMeta.bbox 自行补画。证据与预览彻底
+            # 解耦：既不受 nvdsosd 帧缓存滞后影响（保证告警图必有框），preview 关闭时
+            # 也无需 nvdsosd，省掉每路 GPU OSD 光栅化。
+            tee = add_evidence_capture(p, frame_cache, source_id=i, gpu_id=0, suffix=str(i))
+            p.link(("demux", tee), ("src_%u", ""))
+
+            if not out:
+                continue
             p.add("nvdsosd", f"osd{i}", {
                 "gpu-id": 0,
                 "process-mode": 1,
                 "display-bbox": 1,
                 "display-text": 1,
             })
-            tee = add_evidence_capture(p, frame_cache, source_id=i, gpu_id=0, suffix=str(i))
-            p.link(("demux", f"osd{i}"), ("src_%u", ""))
-            p.link(f"osd{i}", tee)
-
-            if not out:
-                continue
+            p.link(tee, f"osd{i}")
             shm_socket = f"/tmp/vi_cam_{i}"
             _clean_stale_shm_sockets(shm_socket, logger)
             p.add("nvvideoconvert", f"rtsp-conv{i}", {"gpu-id": 0, "compute-hw": 1})
@@ -225,7 +229,7 @@ class PipelineBuilder:
                 "sync": False,
                 "async": 0,
             })
-            p.link(tee, f"rtsp-conv{i}", f"rtsp-caps{i}",
+            p.link(f"osd{i}", f"rtsp-conv{i}", f"rtsp-caps{i}",
                    f"enc{i}", f"parse{i}", f"shm{i}")
             rtsp_mounts[f"{out.get('mount_prefix', '/cam')}/{self.cameras[i]['id']}"] = shm_socket
         return rtsp_mounts
