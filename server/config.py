@@ -82,6 +82,13 @@ def validate_config(config: dict, path: Path):
     errors.extend(_validate_source_reconnect((config.get("source") or {}).get("reconnect")))
     errors.extend(_validate_source_health(((config.get("source") or {}).get("health")) or {}))
 
+    drop = (config.get("source") or {}).get("drop_frame_interval")
+    if drop is not None and (not isinstance(drop, int) or isinstance(drop, bool) or drop < 1):
+        errors.append(
+            f"source.drop_frame_interval 必须是不小于 1 的整数（1=不抽帧，N=每 N 帧放行 1 帧），"
+            f"当前: {drop!r}"
+        )
+
     if errors:
         raise ValueError(f"配置校验失败 ({path}):\n  " + "\n  ".join(errors))
 

@@ -125,6 +125,10 @@ class PipelineBuilder:
         if rtsp_protocol not in (1, 2, 4, 7):
             logger.warning("未知 source.rtsp_protocol={}，回退默认 4 (TCP)", rtsp_protocol)
             rtsp_protocol = 4
+        # 解码侧抽帧：每 N 帧放行 1 帧（1=不抽帧）。全局生效，用于吞吐实验。
+        drop_interval = int(src_cfg.get("drop_frame_interval", 1))
+        if drop_interval > 1:
+            logger.info("source.drop_frame_interval={}（每 {} 帧放行 1 帧）", drop_interval, drop_interval)
 
         # DS 版本属性差异探测：如 rtsp-reconnect-timeout 在 DS9.0 已被移除
         supported = _supported_nvurisrcbin_props(logger)
@@ -152,6 +156,7 @@ class PipelineBuilder:
             p.add("nvurisrcbin", f"src{i}", src_props({
                 "uri": cam["rtsp_url"],
                 "select-rtp-protocol": rtsp_protocol,
+                "drop-frame-interval": drop_interval,
                 "rtsp-reconnect-attempts": int(rc["attempts"]),
                 "rtsp-reconnect-timeout": int(rc["timeout"]),
                 "rtsp-reconnect-interval": int(rc["interval"]),

@@ -223,9 +223,9 @@ cameras:
 #                           = UTC 16:04），窗口 ±5min 内只记录不动作
 source:
   rtsp_protocol: 4
-  # Phase 2 预留（当前未启用）：解码侧抽帧，每 N 帧只放行 1 帧（先全局，做系统级吞吐实验）。
-  # 启用时由 builder 注入 nvurisrcbin drop-frame-interval；Phase 1 不接线、不改变行为。
-  # drop_frame_interval: 2
+  # 解码侧抽帧（全局）：每 N 帧只放行 1 帧。1=不抽帧（默认）；吞吐实验时改 2 / 4。
+  # 由 builder 注入 nvurisrcbin drop-frame-interval，N 倍降低 decode→infer→OSD/appsink 负载。
+  drop_frame_interval: 1
   reconnect:
     attempts: 10
     timeout: 10

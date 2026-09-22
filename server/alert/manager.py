@@ -224,7 +224,10 @@ class AlertManager:
             #    snapshot 为 None 时跳过，payload.frame_base64=null
             buffer = None
             if snapshot is not None:
-                frame = self._render_evidence(snapshot, rule_name, alert_objects)
+                # snapshot 是延迟句柄（EvidenceFrame）或 BGR ndarray；前者只在
+                # 真正编码告警时触发 GPU→CPU，告警稀疏 → 常态零拷贝。
+                frame_src = snapshot.bgr() if hasattr(snapshot, "bgr") else snapshot
+                frame = self._render_evidence(frame_src, rule_name, alert_objects)
                 buffer = simplejpeg.encode_jpeg(frame, quality=85, colorspace='BGR')
 
             # 3. Fire-and-forget: base64 → JSON → HTTP 全部在独立 daemon 线程
