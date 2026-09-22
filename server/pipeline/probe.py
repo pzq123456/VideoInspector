@@ -3,13 +3,23 @@ DeepStream 探针 → 告警状态机桥（配置驱动）
 
 把两阶段检测（person 锚点整帧检测 + detector 整帧 + classifier 二级分类）的 batch
 元数据翻译成 server.metadata.ObjectMeta 列表，按 source_id 喂给对应的 AlertManager；
-同时决定 OSD 渲染内容（nvdsosd 原生渲染，证据帧与实时预览共享同一渲染源）。
+同时决定**预览**的 OSD 渲染内容（nvdsosd 原生渲染）。证据帧是原始帧，违规框由
+AlertManager 在编码前自画，与此处 OSD 策略无关（见 pipeline/frame_cache 与 alert/manager）。
 
-渲染策略「一刀切干净」：nvdsosd 默认会把每个对象按默认色画出来，因此**不画 = 显式隐藏**
+渲染策略（OSD policy）:
+
+    person     → 应用控制：违规 = 红框 + 违规标签；合规 / 低置信度 = 隐藏
+    非 person  → 一律无条件隐藏（无论其规则本路是否激活）
+
+注意：所有 GIE 对每一路都会推理，`active_rules` 只决定「本路判定/告警哪些规则」，并不
+决定「哪些模型不推理」。若按 active_rules 决定隐藏哪些 detector，未激活规则的 detector
+对象会保留 nvinfer 默认 OSD（border_width=3 + obj_label），在 nvdsosd 上泄漏出框
+（如 smoking-only 路泄漏 helmet 框）。因此「是否参与推理」与「是否允许上屏」必须彻底
+解耦：非 person 无条件隐藏。
+
+nvdsosd 默认会把每个对象按默认色画出来，因此**不画 = 显式隐藏**
 （rect_params.border_width=0 + 清空 text_params.display_text——nvosd 对未设置 text 的
-对象会自动显示 obj_label/分类器标签）。只保留违规 person 的红框 + 违规标签，其余一律
-隐藏：detector 检测框（head/helmet/cigarette）、合规 person、低于置信度门槛的 person。
-证据帧因此只含违规者标注，预览同。
+对象会自动显示 obj_label/分类器标签）。此策略只作用于实时预览。
 
 nvosd 经验值：违规框 border_width 实测 2 不上屏、4 起正常渲染，取 4（1080p 下粗细
 与辨识度均衡，GPU 光栅化对小宽度有下限）。
@@ -108,22 +118,23 @@ class SafetyProbe(BatchMetadataOperator):
                 if kind == KIND_DETECTOR:
                     active_detector_uids.add(uid)
 
-            # 第一趟: 收集 detector 检测框的普通数值（label/conf/中心点），不持有包装器；
-            # 同时隐藏这些框（违规呈现统一收敛到 person 红框 + 标签，不画 detector 框）。
-            detector_boxes: dict[int, list] = {}
-            for uid in active_detector_uids:
-                boxes = []
-                for o in frame_meta.object_items:  # 一次性迭代器
-                    if o.unique_component_id == uid:
-                        o.rect_params.border_width = _HIDE_BOX
-                        o.text_params.display_text = _HIDE_TEXT
-                        boxes.append((
-                            getattr(o, "label", ""),
-                            o.confidence,
-                            o.rect_params.left + o.rect_params.width / 2,
-                            o.rect_params.top + o.rect_params.height / 2,
-                        ))
-                detector_boxes[uid] = boxes
+            # 第一趟: OSD policy —— 非 person 一律无条件隐藏（与 active_rules 解耦）。
+            # 同时收集本路激活 detector 的普通数值（label/conf/中心点）供 person 空间
+            # 关联；object_items 是一次性迭代器，隐藏与收集必须同一趟完成。
+            detector_boxes: dict[int, list] = {uid: [] for uid in active_detector_uids}
+            for o in frame_meta.object_items:
+                uid = o.unique_component_id
+                if uid == self._person_uid:
+                    continue
+                o.rect_params.border_width = _HIDE_BOX
+                o.text_params.display_text = _HIDE_TEXT
+                if uid in active_detector_uids:
+                    detector_boxes[uid].append((
+                        getattr(o, "label", ""),
+                        o.confidence,
+                        o.rect_params.left + o.rect_params.width / 2,
+                        o.rect_params.top + o.rect_params.height / 2,
+                    ))
 
             # 第二趟: 每个 person → ObjectMeta（违规进 attributes）+ 渲染决策
             objects: list[ObjectMeta] = []
@@ -174,11 +185,21 @@ class SafetyProbe(BatchMetadataOperator):
 
             manager = self._managers.get(source_id)
             if manager is not None:
-                snapshot = (
-                    self._frame_cache.latest(source_id)
-                    if self._frame_cache else None
-                )
-                manager.handle(objects, snapshot=snapshot, executor=self._executor)
+                snapshot, frame_info = None, None
+                if self._frame_cache is not None:
+                    entry = self._frame_cache.latest_with_meta(source_id)
+                    if entry is not None:
+                        snapshot, snap_fn, snap_ts = entry
+                        # decision 侧取本帧元数据；snapshot 侧取缓存帧，供告警时打
+                        # evidence 同步日志（delta_fn / delta_ms），用于验证证据帧滞后。
+                        frame_info = (
+                            getattr(frame_meta, "frame_number", -1),
+                            getattr(frame_meta, "buffer_pts", 0),
+                            snap_fn,
+                            snap_ts,
+                        )
+                manager.handle(objects, snapshot=snapshot,
+                               executor=self._executor, frame_info=frame_info)
             elif objects:
                 logger.debug("source_id={} 无对应 AlertManager，跳过告警判定", source_id)
 

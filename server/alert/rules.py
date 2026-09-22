@@ -26,6 +26,9 @@ class RuleConfig:
     cooldown_seconds: float
     min_detection_count: int
     attribute_threshold: float
+    # OSD/payload 展示名（可选，预留字段）：未配置时回退为规则名。
+    # 当前 OSD 与 payload 仍使用规则名（ASCII），渲染行为暂不改变。
+    display_name: str | None = None
 
 
 def parse_rules(raw: dict | None) -> dict[str, RuleConfig]:
@@ -41,6 +44,7 @@ def parse_rules(raw: dict | None) -> dict[str, RuleConfig]:
         cooldown = cfg.get("cooldown_seconds")
         min_count = cfg.get("min_detection_count")
         threshold = cfg.get("attribute_threshold")
+        display_name = cfg.get("display_name")
         if not isinstance(gie, str) or not gie:
             raise ValueError(f"rules.{name}.gie 为必填项（引用 model.gies 名称）")
         if not isinstance(cooldown, (int, float)) or cooldown < 0:
@@ -49,11 +53,14 @@ def parse_rules(raw: dict | None) -> dict[str, RuleConfig]:
             raise ValueError(f"rules.{name}.min_detection_count 必须是 >=1 的整数")
         if not isinstance(threshold, (int, float)) or not (0.0 <= threshold <= 1.0):
             raise ValueError(f"rules.{name}.attribute_threshold 必须是 0~1 的置信度")
+        if display_name is not None and not isinstance(display_name, str):
+            raise ValueError(f"rules.{name}.display_name 必须是字符串")
         rules[name] = RuleConfig(
             name=name,
             gie=gie,
             cooldown_seconds=float(cooldown),
             min_detection_count=int(min_count),
             attribute_threshold=float(threshold),
+            display_name=(display_name or name),
         )
     return rules

@@ -13,7 +13,7 @@
                 └── server/pipeline/builder.py:PipelineBuilder = 管线构建
 
     RTSP 源×N → nvstreammux(batch=N) → [detector/classifier 链] → nvstreamdemux
-    → 每路: nvdsosd → tee → [ shmsink(→ RTSP) | appsink(证据帧) ]
+    → 每路: tee → [ appsink(原始证据帧) | nvdsosd → shmsink(→RTSP, 仅开启 output) ]
 
 断流自愈（Plan A + B）:
     A. nvurisrcbin 内置重连参数收敛为有限次数（source.reconnect.attempts），

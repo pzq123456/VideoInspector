@@ -54,6 +54,9 @@ model:
 # 告警规则（每条规则独立状态机；gie 引用 model.gies 的名称）
 #   classifier 的 classifier-threshold 由 attribute_threshold 启动时重写进 INI；
 #   detector 的 attribute_threshold 同时作为空间关联门限。
+#   display_name（可选，预留）：未来用于 OSD/payload 展示名；未配置回退规则名，
+#   当前渲染行为不变（仍用 ASCII 规则名）。
+#   例：no_vest: { gie: vest_cls, ..., display_name: "未穿反光衣" }
 # -----------------------------------------------------------------------------
 rules:
   no_helmet:
@@ -226,6 +229,9 @@ cameras:
 #                           = UTC 16:04），窗口 ±5min 内只记录不动作
 source:
   rtsp_protocol: 4
+  # 解码侧抽帧（全局）：每 N 帧只放行 1 帧。1=不抽帧（默认）；吞吐实验时改 2 / 4。
+  # 由 builder 注入 nvurisrcbin drop-frame-interval，N 倍降低 decode→infer→OSD/appsink 负载。
+  drop_frame_interval: 1
   reconnect:
     attempts: 10
     timeout: 10
@@ -241,14 +247,16 @@ source:
     maintenance_window: "16:04"
 
 # -----------------------------------------------------------------------------
-# RTSP 输出（注释掉 output 节即关闭）
+# RTSP 输出（已关闭实时预览：整节注释）
+# 关闭后 builder 跳过每路 nvvideoconvert/capsfilter/encoder/parser/shmsink，
+# 也不再启动 RTSP server；nvdsosd + 证据 appsink 保留，告警证据不受影响。
 # -----------------------------------------------------------------------------
-output:
-  rtsp_port: 8554
-  mount_prefix: /cam
-  codec: h264
-  bitrate: 4000000
-  idrinterval: 30
+# output:
+#   rtsp_port: 8554
+#   mount_prefix: /cam
+#   codec: h264
+#   bitrate: 4000000
+#   idrinterval: 30
 
 # -----------------------------------------------------------------------------
 # 日志参数

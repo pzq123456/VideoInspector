@@ -72,13 +72,14 @@ cameras:                                # active_rules 声明本路叠加哪些�
 ```
 RTSP×N → nvstreammux(batch=N) → nvinfer(person) → queue → nvinfer(helmet)
                                → queue → nvinfer(harness_cls) → queue → nvinfer(vest_cls)
-                               → nvstreamdemux → 每路: nvdsosd → tee → [ shmsink(→RTSP) | appsink(证据帧) ]
+                               → nvstreamdemux → 每路: tee → [ appsink(原始证据帧) | nvdsosd → shmsink(→RTSP) ]
 ```
 
 探针挂在最后一个 nvinfer，把元数据翻译成 `ObjectMeta` 喂给对应摄像头的 `AlertManager`
-（按规则独立状态机 `IDLE→ARMING→COOLDOWN`），并决定 OSD 渲染内容：只画违规 person
-的红框 + 违规标签，detector 检测框 / 合规与低置信度 person 一律隐藏（证据帧与预览
-同此策略，画面只关注违规者）。
+（按规则独立状态机 `IDLE→ARMING→COOLDOWN`），并决定**预览** OSD 渲染内容：只画违规
+person 的红框 + 违规标签，detector 检测框 / 合规与低置信度 person 一律隐藏。证据支路
+挂在 nvdsosd **之前**，采集原始帧，由 `AlertManager` 在编码前用 `ObjectMeta.bbox`
+自画违规框——证据与预览解耦，保证告警图必有框（且关闭 output 时不再需要 nvdsosd）。
 
 ## Webhook payload
 

@@ -1,18 +1,21 @@
 """
-证据帧采集：每路摄像头独立的 tee 分支 → appsink → 缓存最新已渲染帧
+证据帧采集：每路摄像头独立的 tee 分支 → appsink → 缓存最新**原始帧**（未叠加 OSD）
 
 SafetyProbe（BatchMetadataOperator）只拿得到 batch 元数据、拿不到像素，
 因此告警证据帧必须另走一条帧分支。新拓扑在 nvstreamdemux **拆流后**，
-每路独立挂载一条：
+每路独立挂载一条（tee 在 nvdsosd **之前**，证据与预览解耦）：
 
-    demux.src_i → nvdsosd_i → tee_i → [ rtsp 支路 | 证据支路 ]
-                                          └── queue → nvvideoconvert → capsfilter(NVMM RGB) → appsink
+    demux.src_i → tee_i → [ 证据支路 | nvdsosd_i → rtsp 支路（仅开启 output 时） ]
+                              └── queue → nvvideoconvert → capsfilter(NVMM RGB) → appsink
 
-nvdsosd_i 已在该路帧上**原生渲染**违规红框/违规标签（SafetyProbe 决定渲染内容，
-非违规对象显式隐藏），appsink 采集到的即是与实时预览一致的 OSD 渲染帧（且已按
-source 隔离，不会跨流污染）。appsink 的 FrameCaptureRetriever.consume() 把最新一帧转成
-BGR numpy 缓存进 FrameCache（{source_id: frame}）。告警触发时探针从缓存取
-该 source 的帧作为 snapshot 交给 AlertManager，由 executor 线程 JPEG 编码。
+appsink 采集到的是**未经 OSD 的原始帧**（已按 source 隔离，不会跨流污染）。
+FrameCaptureRetriever.consume() 只对最新一帧做 **GPU clone**（延迟转换），连同该帧的
+frame_number / buffer PTS 缓存进 FrameCache（{source_id: (EvidenceFrame, fn, ts)}）；
+GPU→CPU 与色彩转换推迟到真正编码告警图时（EvidenceFrame.bgr()）。
+告警触发时探针取该 source 的 snapshot + 元信息交给 AlertManager：违规红框/标签由
+AlertManager 在 JPEG 编码前用 ObjectMeta.bbox 自画——因此证据图是否带框与 nvdsosd /
+预览 / 帧缓存滞后**无关**；元信息用于打 evidence 同步日志（decision vs snapshot 的
+delta，仅观测）。
 
 线程模型（与 alert/manager.py 的 fire-and-forget 分工一致）：
   - appsink 流线程  ：consume() 写缓存。每帧换入**新数组**、绝不原地改旧数组，
@@ -44,20 +47,65 @@ except Exception:  # pragma: no cover
     cupy = None
 
 
+def _tensor_to_bgr(tensor) -> np.ndarray:
+    """GPU 张量 → BGR numpy（device→host 拷贝 + cvtColor）。"""
+    try:
+        if cupy is not None:
+            arr = cupy.from_dlpack(tensor).get()
+        else:
+            arr = np.from_dlpack(tensor).copy()
+    except Exception:
+        arr = np.from_dlpack(tensor).copy()
+    if arr.ndim == 3 and arr.shape[2] >= 3:
+        if arr.shape[2] == 4:
+            arr = cv2.cvtColor(arr, cv2.COLOR_RGBA2BGR)
+        else:
+            arr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+    return arr
+
+
+class EvidenceFrame:
+    """延迟转换的证据帧句柄。
+
+    consume() 只 clone GPU 张量（buffer 会被 GStreamer 回收，必须留副本），
+    **不做 GPU→CPU / cvtColor**；只有真正要编码告警图时才调用 bgr()。
+    告警稀疏 → 常态下省掉每帧每路的 device→host 拷贝与色彩转换。
+    """
+
+    __slots__ = ("_tensor", "_bgr")
+
+    def __init__(self, tensor):
+        self._tensor = tensor
+        self._bgr = None
+
+    def bgr(self) -> np.ndarray:
+        if self._bgr is None:
+            self._bgr = _tensor_to_bgr(self._tensor)
+            self._tensor = None  # 转换完成即释放 GPU 引用
+        return self._bgr
+
+
 class FrameCache:
-    """线程安全的最新帧缓存：{source_id: BGR numpy 数组}。"""
+    """线程安全的最新帧缓存：{source_id: (EvidenceFrame, frame_number, buffer PTS)}。"""
 
     def __init__(self):
-        self._frames: dict[int, np.ndarray] = {}
+        self._entries: dict[int, tuple[EvidenceFrame, int, int]] = {}
         self._lock = threading.Lock()
 
-    def set(self, source_id: int, frame: np.ndarray):
+    def set(self, source_id: int, frame: EvidenceFrame,
+            frame_number: int = -1, timestamp: int = 0):
         with self._lock:
-            self._frames[source_id] = frame
+            self._entries[source_id] = (frame, frame_number, timestamp)
 
-    def latest(self, source_id: int) -> np.ndarray | None:
+    def latest(self, source_id: int) -> EvidenceFrame | None:
         with self._lock:
-            return self._frames.get(source_id)
+            entry = self._entries.get(source_id)
+            return entry[0] if entry is not None else None
+
+    def latest_with_meta(self, source_id: int) -> tuple[EvidenceFrame, int, int] | None:
+        """返回 (EvidenceFrame, frame_number, buffer PTS)；尚无缓存帧时为 None。"""
+        with self._lock:
+            return self._entries.get(source_id)
 
 
 class FrameCaptureRetriever(BufferRetriever):
@@ -75,13 +123,27 @@ class FrameCaptureRetriever(BufferRetriever):
 
     def consume(self, buffer):
         try:
-            # 单路（demux 后）缓冲：直接取 batch_id=0，source_id 由构造时固定
-            frame = self._to_bgr(buffer, 0)
-            if frame is not None:
-                self._cache.set(self._source_id, frame)
+            # 单路（demux 后）缓冲：直接取 batch_id=0，source_id 由构造时固定。
+            # 只做 GPU clone（buffer 即将被 GStreamer 回收，必须留副本），
+            # 不做 GPU→CPU：真正编码告警图时才由 EvidenceFrame.bgr() 转换。
+            tensor = buffer.extract(0).clone()
+            frame_number, timestamp = self._frame_info(buffer)
+            self._cache.set(self._source_id, EvidenceFrame(tensor), frame_number, timestamp)
         except Exception:
             logger.exception("证据帧缓存失败，跳过本帧")
         return 1  # 成功放行，不阻塞下游
+
+    @staticmethod
+    def _frame_info(buffer) -> tuple[int, int]:
+        """取本 buffer 的 (frame_number, buffer PTS)；读取失败时回退 (-1, 0)。"""
+        try:
+            frame_meta = next(iter(buffer.batch_meta.frame_items), None)
+            if frame_meta is not None:
+                return (int(getattr(frame_meta, "frame_number", -1)),
+                        int(getattr(buffer, "timestamp", 0) or 0))
+        except Exception:
+            pass
+        return -1, 0
 
     @staticmethod
     def _to_bgr(buffer, batch_id: int) -> np.ndarray | None:
